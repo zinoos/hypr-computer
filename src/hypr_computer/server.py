@@ -37,9 +37,9 @@ By default you work on your OWN agent desktop: a separate Hyprland session with 
 keyboard focus, clipboard, D-Bus and apps, started on first use. It lives on one of the user's desktop
 numbers 4-9/0 (1-3 are theirs): they press Super+N to watch you live, while they keep working
 undisturbed elsewhere. It starts empty: launch() the apps you need (browsers get a separate profile,
-so the user's logins aren't there; ask them to log in via agent_desktop(action='viewer', hands_on=true)
-if needed). Only switch to the user's real desktop (agent_desktop(action='use_host')) when the task
-needs their own open windows, and say so first: there you share their single mouse and keyboard.
+so the user's logins aren't there). Your cursor and keyboard are yours alone: the user's input never
+reaches your desktop and you can never move or type with theirs. agent_desktop(action='use_host') only
+lets you look at the user's real desktop (screenshots, OCR, window list), not act on it.
 
 Coordinates: every screenshot/zoom returns a frame id (f1, f2, ...). x/y you pass to click, move,
 drag, scroll refer to the pixels of the most recent frame unless you pass frame= or coords='screen'
@@ -71,8 +71,18 @@ Coords = Literal["image", "screen"]
 # ====================================================================== targets
 
 
+HOST_INPUT = os.environ.get("HYPR_COMPUTER_ALLOW_HOST_INPUT") == "1"
+
+
 def V() -> VirtualInput:
-    return _desk_input if (target.is_agent() and _desk_input) else _host_input
+    if target.is_agent() and _desk_input:
+        return _desk_input
+    if not HOST_INPUT:
+        # The user's cursor and keyboard are theirs alone: agents never get to move or type with them.
+        raise InputError("input to the user's own desktop is disabled: agents only use their own cursor and "
+                         "keyboard on an agent desktop (agent_desktop(action='use_agent')). Looking (screenshot, "
+                         "ocr, windows) still works here.")
+    return _host_input
 
 
 def AX():
@@ -1163,7 +1173,7 @@ def agent_desktop(
     action: Annotated[Literal["status", "start", "stop", "viewer", "use_host", "use_agent"], Field(description=(
         "status: where tools act + all agent desktops. start: start/attach an agent desktop (name= to pick one). "
         "stop: shut one down (its apps close). viewer: change how the user sees it. "
-        "use_host: act on the user's real desktop (shared mouse/keyboard!). use_agent: back to the agent desktop."))] = "status",
+        "use_host: look at the user's real desktop (read-only). use_agent: back to the agent desktop."))] = "status",
     name: Annotated[str | None, Field(description="agent desktop name (default: this session's)")] = None,
     place: Annotated[int | None, Field(description=(
         "start: which of the user's desktops (Super+N) the agent gets: 4-9 or 0. Default: the first free one. "
@@ -1177,9 +1187,6 @@ def agent_desktop(
     scale: Annotated[float, Field(description="viewer size relative to the agent screen (pip/window)")] = 0.5,
     corner: Annotated[Literal["bottom-right", "bottom-left", "top-right", "top-left"], Field(
         description="pip corner")] = "bottom-right",
-    hands_on: Annotated[bool | None, Field(description=(
-        "viewer: let the user click/type into the agent desktop through the viewer (true) or keep it "
-        "watch-only (false, default) so their mouse passing over it never disturbs you"))] = None,
 ):
     """Manage agent desktops: separate Hyprland sessions with their own cursor, keyboard focus, clipboard
     and apps, which the user watches in a live viewer window while using their own desktop."""
@@ -1189,8 +1196,9 @@ def agent_desktop(
         _mode = "host"
         target.activate(h)
         frames.last = None
-        return ("now acting on the USER'S real desktop: you share their mouse and keyboard, and input is "
-                "refused while their screen is locked. agent_desktop(action='use_agent') goes back.")
+        return ("now looking at the USER'S real desktop: screenshots/ocr/windows work, input is disabled "
+                "(their cursor and keyboard are theirs alone). agent_desktop(action='use_agent') goes back."
+                if not HOST_INPUT else "now acting on the user's real desktop (HYPR_COMPUTER_ALLOW_HOST_INPUT=1)")
     if action == "use_agent":
         _mode = "agent"
         note = _ensure_target()
@@ -1216,8 +1224,6 @@ def agent_desktop(
         d = next((x for x in agentdesk.list_desks() if x.name == name), None) if name else _desk
         if d is None:
             return "no agent desktop running"
-        if hands_on is not None:
-            return agentdesk.set_hands_on(d, hands_on)
         return agentdesk.place_viewer(d, viewer, scale, corner)
     rows = ["places 1-3: the user's; 4-9 and 0: agent desktops",
             f"mode: {_mode}; tools act on: " + (f"agent desktop {_desk.name!r}" if target.is_agent() and _desk

@@ -1,9 +1,8 @@
 """Agent desktops: a nested Hyprland per agent, with its own seat (cursor, keyboard focus), clipboard,
 Xwayland and D-Bus session. It renders to a headless output, so it keeps working while nobody looks at it.
 A window on the user's desktop mirrors it live (the viewer), so the user sees the agent's cursor and windows.
-Closing the viewer stops the agent desktop.
-
-    python -m hypr_computer.agentdesk keep NAME   # internal: watchdog that stops NAME when its viewer closes
+Nothing of the user's input can reach it: the nested compositor's own host window (its only input path)
+is closed right after start, and the viewer is a capture-only picture. Closing the viewer stops the desk.
 """
 
 from __future__ import annotations
@@ -40,11 +39,8 @@ hl.config({{
               disable_watchdog_warning = true }},
     input = {{ kb_layout = "{layout}", kb_variant = "{variant}", follow_mouse = 1 }},
 }})
--- The agent's real screen is a headless output; viewer windows on the user's desktop mirror it.
+-- The agent's real screen is a headless output (the user watches it through a capture-only viewer).
 hl.monitor({{ output = "{headless}", mode = "{width}x{height}@60", position = "0x0", scale = 1 }})
-for i = 1, 4 do
-    hl.monitor({{ output = "WAYLAND-" .. i, mode = "preferred", position = "auto", scale = 1, mirror = "{headless}" }})
-end
 """
 
 ACCENTS = ["ff8c1a", "33c3ff", "b26bff", "4cd964", "ff4f7b", "ffd60a"]
@@ -74,6 +70,7 @@ class Desk:
     place: int = 0  # canvas place / workspace number the viewer lives on (Super+N); 0 = none
     monitor: str = ""
     aux_pids: list = field(default_factory=list)  # AT-SPI launcher/registry on the private bus
+    viewer_pid: int = 0  # the watch-only viewer on the user's desktop
 
     @property
     def env(self) -> dict:
@@ -252,13 +249,10 @@ def start(name: str | None = None, width: int | None = None, height: int | None 
     log = open(os.path.join(run_dir, "hyprland.log"), "w")
     proc = subprocess.Popen(["Hyprland", "-c", cfg], env=env, stdout=log, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL, start_new_session=True, cwd=state_dir)
-    if place:
-        # Host side (agent-places.lua): when this pid's window opens, it goes straight into its place,
-        # without splitting the place the user is on or taking their focus.
-        try:
-            hypr.eval_lua(f"if AgentPlaces then AgentPlaces.claim({proc.pid}, {place}) end", host_sig)
-        except HyprError:
-            pass
+    # Hyprland can only start nested with a window on the host (its Wayland backend). That window would
+    # forward the user's pointer and keyboard into the agent's seat, so it is closed as soon as the
+    # headless screen exists; until then it waits on the agent's place, out of the user's way.
+    _claim(proc.pid, place or AGENT_PLACES[-1], host_sig)
 
     inst = None
     t0 = time.time()
@@ -280,47 +274,91 @@ def start(name: str | None = None, width: int | None = None, height: int | None 
         raise AgentDeskError("nested Hyprland did not come up within 15 s")
     sig = inst["instance"]
 
-    # The real screen: a headless output that renders even when the viewer is hidden.
+    # The agent's real screen: a headless output (it renders whether or not anyone watches).
     hypr.request(f"output create headless {HEADLESS}", inst=sig)
     time.sleep(0.3)
-    hypr.request("reload", inst=sig)  # re-applies the monitor rules: the viewer output now mirrors
-
     d = Desk(name=name, pid=proc.pid, sig=sig, wl_socket=inst["wl_socket"], dbus=bus, dbus_pid=dbus_pid,
              width=width, height=height, owner_pid=os.getpid(), state_dir=state_dir, run_dir=run_dir,
              host_sig=host_sig, host_wayland=host_wayland, accent=accent, created=time.time(),
              place=place or 0, monitor=(area or {}).get("monitor", ""), aux_pids=aux)
-    d.save()
-
-    note = ""
-    viewer_win = _wait_viewer(d, host_before)
-    if viewer_win:
-        time.sleep(0.5)
-        place_viewer(d, viewer, index=idx)
-        if not ensure_mirror(d):
-            note = "the viewer is not mirroring the agent screen"
-    # New windows open on the focused monitor; that must be the headless screen, not the (mirroring) viewer.
+    _close_backend_windows(d)
+    # New windows open on the focused monitor: the headless screen.
     for lua in (f'hl.dsp.focus({{monitor = "{HEADLESS}"}})', 'hl.dsp.focus({workspace = "1"})'):
         try:
             hypr.dispatch(lua, sig)
         except HyprError:
             pass
-        now = (hypr.query("activewindow", host_sig) or {}).get("address")
-        if host_active and now != host_active:
-            try:
-                hypr.dispatch(f'hl.dsp.focus({{window = "address:{host_active}"}})', host_sig)
-            except HyprError:
-                pass
-    else:
-        note = "viewer window did not appear on the host"
+    d.save()
+
+    note = ""
+    if viewer != "none":
+        try:
+            note = show_viewer(d, viewer, index=idx)
+        except AgentDeskError as ex:
+            note = str(ex)
+    now = (hypr.query("activewindow", host_sig) or {}).get("address")
+    if host_active and now != host_active:
+        try:
+            hypr.dispatch(f'hl.dsp.focus({{window = "address:{host_active}"}})', host_sig)
+        except HyprError:
+            pass
     try:
-        hypr.eval_lua(f'hl.notification.create({{text = "{name}: agent desktop", timeout = 4000, color = "rgb({accent})"}})', sig)
+        hypr.eval_lua(f'hl.notification.create({{text = "{name}: agent desktop", timeout = 4000, '
+                      f'color = "rgb({accent})"}})', sig)
     except HyprError:
         pass
-    subprocess.Popen([sys.executable, "-m", "hypr_computer.agentdesk", "keep", name], start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     env=dict(os.environ, PYTHONPATH=os.pathsep.join(sys.path)))
-    where = f", live on the user's place {place_label(place)} (Super+{place_label(place)})" if place else ""
-    return d, f"started agent desktop {name!r} ({width}x{height}){where}" + (f"; {note}" if note else "")
+    return d, f"started agent desktop {name!r} ({width}x{height}); {note}"
+
+
+def _claim(pid: int, place: int, host_sig: str):
+    """agent-places.lua: when this pid's window opens it goes straight into `place`, without splitting the
+    place the user is on, taking their focus or moving their camera."""
+    try:
+        hypr.eval_lua(f"if AgentPlaces then AgentPlaces.claim({pid}, {place}) end", host_sig)
+    except HyprError:
+        pass
+
+
+def _close_backend_windows(d: Desk, timeout: float = 10.0):
+    """Close the nested compositor's own window(s) on the host: they are the only path by which the user's
+    input could reach the agent's seat. The agent desktop keeps running on its headless screen."""
+    t0 = time.time()
+    seen = False
+    while time.time() - t0 < timeout:
+        wins = [c for c in hypr.query("clients", d.host_sig) if c["pid"] == d.pid]
+        for w in wins:
+            seen = True
+            try:
+                hypr.dispatch(f'hl.dsp.window.close({{window = "address:{w["address"]}"}})', d.host_sig)
+            except HyprError:
+                pass
+        if seen and not wins:
+            return
+        time.sleep(0.2)
+
+
+def show_viewer(d: Desk, mode: str = "place", index: int = 0) -> str:
+    """Open (or re-open) the watch-only viewer on the user's desktop and put it where `mode` says."""
+    w = viewer_window(d)
+    if w is None:
+        env = dict(os.environ, WAYLAND_DISPLAY=d.host_wayland, HYPRLAND_INSTANCE_SIGNATURE=d.host_sig)
+        proc = subprocess.Popen([sys.executable, "-m", "hypr_computer.viewer", d.name], env=env,
+                                start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=open(os.path.join(d.run_dir, "viewer.log"), "w"))
+        if mode == "place" and d.place:
+            _claim(proc.pid, d.place, d.host_sig)
+        d.viewer_pid = proc.pid
+        d.save()
+        t0 = time.time()
+        while time.time() - t0 < 15 and w is None:
+            if proc.poll() is not None:
+                raise AgentDeskError(f"viewer exited; see {d.run_dir}/viewer.log")
+            time.sleep(0.15)
+            w = viewer_window(d)
+        if w is None:
+            raise AgentDeskError("the viewer window did not appear")
+        time.sleep(0.3)
+    return place_viewer(d, mode, index=index)
 
 
 def _place_area(place: int, host_sig: str) -> dict | None:
@@ -328,28 +366,6 @@ def _place_area(place: int, host_sig: str) -> dict | None:
         return hypr.eval_lua(f"return AgentPlaces and AgentPlaces.area({place}) or nil", host_sig)
     except HyprError:
         return None
-
-
-def ensure_mirror(d: Desk, timeout: float = 3.0) -> bool:
-    """Monitor rules apply on the next reconfigure: if the viewer output isn't mirroring yet, wiggle the
-    viewer window's size by a pixel on the host so the nested compositor reconfigures it."""
-    def ok():
-        mons = hypr.query("monitors all", d.sig)
-        views = [m for m in mons if m["name"].startswith("WAYLAND-")]
-        return bool(views) and all(str(m.get("mirrorOf", "none")) not in ("none", "") for m in views)
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        if ok():
-            return True
-        w = viewer_window(d)
-        if w:
-            sel = f'"address:{w["address"]}"'
-            sx, sy = w["size"]
-            hypr.dispatch(f"hl.dsp.window.resize({{x = {sx - 1}, y = {sy}, relative = false, window = {sel}}})", d.host_sig)
-            time.sleep(0.3)
-            hypr.dispatch(f"hl.dsp.window.resize({{x = {sx}, y = {sy}, relative = false, window = {sel}}})", d.host_sig)
-        time.sleep(0.4)
-    return ok()
 
 
 def _instances() -> list[dict]:
@@ -362,19 +378,11 @@ def _instances() -> list[dict]:
 
 def viewer_window(d: Desk) -> dict | None:
     try:
-        return next((c for c in hypr.query("clients", d.host_sig) if c["pid"] == d.pid), None)
+        if not d.viewer_pid or not _alive(d.viewer_pid):
+            return None
+        return next((c for c in hypr.query("clients", d.host_sig) if c["pid"] == d.viewer_pid), None)
     except HyprError:
         return None
-
-
-def _wait_viewer(d: Desk, host_before: set, timeout: float = 20) -> dict | None:
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        w = viewer_window(d)
-        if w and w["address"] not in host_before:
-            return w
-        time.sleep(0.15)
-    return viewer_window(d)
 
 
 def place_viewer(d: Desk, mode: str = "pip", scale: float = 0.5, corner: str = "bottom-right", index: int = 0) -> str:
@@ -383,10 +391,7 @@ def place_viewer(d: Desk, mode: str = "pip", scale: float = 0.5, corner: str = "
     hidden: tucked away in the special workspace 'agents' (the agent keeps working)."""
     w = viewer_window(d)
     if w is None:
-        _recreate_viewer(d)
-        w = viewer_window(d)
-        if w is None:
-            raise AgentDeskError("no viewer window and could not create one")
+        return show_viewer(d, mode, index=index)
     hs = d.host_sig
     sel = f'"address:{w["address"]}"'
     if mode == "place":
@@ -398,7 +403,6 @@ def place_viewer(d: Desk, mode: str = "pip", scale: float = 0.5, corner: str = "
             ws = (hypr.query("activeworkspace", hs) or {}).get("name", "1")
             hypr.dispatch(f'hl.dsp.window.move({{workspace = {hypr.lua_str(ws)}, follow = false, window = {sel}}})', hs)
         a = hypr.eval_lua(f'return AgentPlaces and AgentPlaces.put("{w["address"]}", {d.place}) or nil', hs)
-        set_hands_on(d, False)
         if a is None:
             hypr.dispatch(f'hl.dsp.window.move({{workspace = "{d.place}", follow = false, window = {sel}}})', hs)
         return f"viewer fills place {place_label(d.place)} (Super+{place_label(d.place)} to watch)"
@@ -439,29 +443,6 @@ def place_viewer(d: Desk, mode: str = "pip", scale: float = 0.5, corner: str = "
     return f"viewer is a floating {vw}x{vh} window on the current place of {m['name']}"
 
 
-def set_hands_on(d: Desk, on: bool) -> str:
-    """Watch-only viewer (no focus: the user's mouse over it doesn't touch the agent's seat) or hands-on."""
-    w = viewer_window(d)
-    if not w:
-        return "no viewer window"
-    try:
-        hypr.eval_lua(f'return AgentPlaces and AgentPlaces.hands_on("{w["address"]}", {"true" if on else "false"})',
-                      d.host_sig)
-    except HyprError:
-        hypr.dispatch(f'hl.dsp.window.set_prop({{prop = "no_focus", value = "{0 if on else 1}", '
-                      f'window = "address:{w["address"]}"}})', d.host_sig)
-    return ("hands-on: the user can click and type in the agent desktop through the viewer" if on else
-            "watch-only: the user's mouse and keyboard don't reach the agent desktop")
-
-
-def _recreate_viewer(d: Desk):
-    host_before = {c["address"] for c in hypr.query("clients", d.host_sig)}
-    hypr.request("output create wayland", inst=d.sig)
-    time.sleep(0.5)
-    _wait_viewer(d, host_before, 5)
-    ensure_mirror(d)
-
-
 def stop(d: Desk) -> str:
     try:
         hypr.dispatch("hl.dsp.exit()", d.sig)
@@ -477,36 +458,10 @@ def stop(d: Desk) -> str:
         except OSError:
             break
         time.sleep(0.8)
-    for pid in d.aux_pids:
+    for pid in d.aux_pids + ([d.viewer_pid] if d.viewer_pid and d.viewer_pid != os.getpid() else []):
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
     _cleanup_files(d)
     return f"stopped agent desktop {d.name!r}"
-
-
-def _keep(name: str):
-    """Watchdog: once the viewer window has existed and then disappears (user closed it), stop the desk."""
-    seen = False
-    gone_since = None
-    while True:
-        time.sleep(1.5)
-        d = next((x for x in list_desks() if x.name == name), None)
-        if d is None:
-            return
-        w = viewer_window(d)
-        if w:
-            seen, gone_since = True, None
-            continue
-        if not seen:
-            continue
-        gone_since = gone_since or time.time()
-        if time.time() - gone_since > 3:
-            stop(d)
-            return
-
-
-if __name__ == "__main__":
-    if len(sys.argv) == 3 and sys.argv[1] == "keep":
-        _keep(sys.argv[2])

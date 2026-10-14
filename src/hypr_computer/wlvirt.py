@@ -44,6 +44,7 @@ class Connection:
         self.globals: dict[str, tuple[int, int]] = {}  # interface -> (name, version)
         self.outputs: list[int] = []
         self._callbacks_done: set[int] = set()
+        self._watched: dict[int, list] = {}  # object id -> queued (opcode, body) events
         self.registry = self._new_id()
         self.send(1, 1, struct.pack("<I", self.registry))  # wl_display.get_registry
         self.roundtrip()
@@ -110,9 +111,36 @@ class Connection:
                 self.outputs.append(name)
             self.globals.setdefault(iface, (name, version))
             return
+        if obj in self._watched:
+            self._watched[obj].append((opcode, body))
+            return
         if opcode == 0 and len(body) == 4:
             # wl_callback.done(serial); other objects' events are ignored (roundtrip only checks its own id)
             self._callbacks_done.add(obj)
+
+    def new_object(self, watch: bool = False) -> int:
+        i = self._new_id()
+        if watch:
+            self._watched[i] = []
+        return i
+
+    def unwatch(self, obj: int):
+        self._watched.pop(obj, None)
+
+    def next_event(self, obj: int, timeout: float = 5.0) -> tuple[int, bytes]:
+        """Block until the watched object `obj` gets an event."""
+        end = time.time() + timeout
+        q = self._watched[obj]
+        while not q:
+            if time.time() > end:
+                raise WaylandError("timed out waiting for an event")
+            self._read_events(end - time.time())
+        return q.pop(0)
+
+    def bind_name(self, name: int, interface: str, version: int) -> int:
+        new = self._new_id()
+        self.send(self.registry, 0, struct.pack("<I", name) + _string(interface) + struct.pack("<II", version, new))
+        return new
 
     def close(self):
         try:
@@ -182,3 +210,71 @@ class VirtualKeyboard:
 
     def modifiers(self, depressed: int, latched: int = 0, locked: int = 0, group: int = 0):
         self.c.send(self.id, 2, struct.pack("<IIII", depressed, latched, locked, group))
+
+
+class ScreenCopy:
+    """zwlr_screencopy_manager_v1 into shared memory: frames of one output, with the cursor drawn in."""
+
+    def __init__(self, conn: Connection, output_name: int | None = None):
+        import mmap
+        self._mmap = mmap
+        self.c = conn
+        self.mgr = conn.bind("zwlr_screencopy_manager_v1", 3)
+        self.shm = conn.bind("wl_shm", 1)
+        name = output_name if output_name is not None else conn.outputs[0]
+        self.output = conn.bind_name(name, "wl_output", 1)
+        self.pool = self.buf = self.mem = None
+        self.geom = None  # (width, height, stride, format)
+        self.fd = None
+        conn.roundtrip()
+
+    def _ensure_buffer(self, w, h, stride, fmt):
+        if self.geom == (w, h, stride, fmt):
+            return
+        if self.buf:
+            self.c.send(self.buf, 0)  # wl_buffer.destroy
+            self.c.send(self.pool, 1)  # wl_shm_pool.destroy
+            self.mem.close()
+            os.close(self.fd)
+        size = stride * h
+        self.fd = os.memfd_create("hc-viewer", 0)
+        os.ftruncate(self.fd, size)
+        self.mem = self._mmap.mmap(self.fd, size)
+        self.pool = self.c._new_id()
+        self.c.send(self.shm, 0, struct.pack("<Ii", self.pool, size), fds=[self.fd])  # create_pool(id, fd, size)
+        self.buf = self.c._new_id()
+        self.c.send(self.pool, 0, struct.pack("<IiiiiI", self.buf, 0, w, h, stride, fmt))
+        self.geom = (w, h, stride, fmt)
+
+    def capture(self, with_damage: bool = False, timeout: float = 10.0):
+        """One frame -> (bytes, width, height, stride, format, y_inverted), or None if it failed.
+        with_damage waits until something on screen changed (cheap when idle)."""
+        frame = self.c.new_object(watch=True)
+        self.c.send(self.mgr, 0, struct.pack("<IiI", frame, 1, self.output))  # capture_output(frame, cursor, output)
+        try:
+            spec = None
+            while True:
+                op, body = self.c.next_event(frame, timeout)
+                if op == 0:  # buffer(format, width, height, stride)
+                    fmt, w, h, stride = struct.unpack_from("<IIII", body)
+                    spec = spec or (w, h, stride, fmt)
+                elif op == 3:
+                    return None
+                elif op == 6:  # buffer_done
+                    break
+            w, h, stride, fmt = spec
+            self._ensure_buffer(w, h, stride, fmt)
+            self.c.send(frame, 2 if with_damage else 0, struct.pack("<I", self.buf))
+            flags = 0
+            while True:
+                op, body = self.c.next_event(frame, timeout)
+                if op == 1:
+                    (flags,) = struct.unpack_from("<I", body)
+                elif op == 2:  # ready
+                    break
+                elif op == 3:
+                    return None
+            return bytes(self.mem[: stride * h]), w, h, stride, fmt, bool(flags & 1)
+        finally:
+            self.c.send(frame, 1)  # destroy
+            self.c.unwatch(frame)
