@@ -245,7 +245,10 @@ def start(name: str | None = None, width: int | None = None, height: int | None 
     env = dict(os.environ)
     for k in ("HYPRLAND_INSTANCE_SIGNATURE", "HYPRLAND_CMD", "DISPLAY", "XDG_SESSION_ID"):
         env.pop(k, None)
-    env.update(WAYLAND_DISPLAY=host_wayland, DBUS_SESSION_BUS_ADDRESS=bus)
+    # HYPRLAND_NO_SD_VARS: otherwise the nested Hyprland imports its WAYLAND_DISPLAY/DISPLAY/
+    # HYPRLAND_INSTANCE_SIGNATURE/PATH into the user's systemd + D-Bus activation environment
+    # (and unsets them on exit), so services started afterwards land on the agent desktop.
+    env.update(WAYLAND_DISPLAY=host_wayland, DBUS_SESSION_BUS_ADDRESS=bus, HYPRLAND_NO_SD_VARS="1")
     log = open(os.path.join(run_dir, "hyprland.log"), "w")
     proc = subprocess.Popen(["Hyprland", "-c", cfg], env=env, stdout=log, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL, start_new_session=True, cwd=state_dir)
