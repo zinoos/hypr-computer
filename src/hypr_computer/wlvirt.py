@@ -84,7 +84,10 @@ class Connection:
 
     def _read_events(self, timeout: float):
         self.sock.settimeout(max(0.01, timeout))
-        data = self.sock.recv(65536)
+        try:
+            data = self.sock.recv(65536)
+        except TimeoutError:
+            raise WaylandError("timed out waiting for the compositor") from None
         if not data:
             raise WaylandError("compositor closed the connection")
         self._buf += data

@@ -339,6 +339,7 @@ def _guard(fn):
             res = fn(*a, **kw)
             if note:
                 res = [note] + (res if isinstance(res, list) else [res])
+            _record_activity(fn.__name__, res)
             return res
         except (HyprError, ScreenError, InputError, A11yError, AgentDeskError, ValueError, TimeoutError) as ex:
             rel = V().release_all()
@@ -347,6 +348,32 @@ def _guard(fn):
             rel = V().release_all()
             return f"error: {type(ex).__name__}: {ex}" + (f" (released held: {', '.join(rel)})" if rel else "")
     return wrapper
+
+
+_PASSIVE = {"agent_desktop", "desktop", "windows", "apps", "a11y_apps", "hyprland"}
+_LOOKING = {"screenshot": "looking at the screen", "zoom": "zooming in for a closer look", "ocr": "reading text",
+            "a11y_tree": "inspecting the app's controls", "wait": "waiting", "clipboard": "using the clipboard"}
+
+
+def _record_activity(name: str, res):
+    """agentControl shows an agent desktop as live while the agent works on it, with its last action."""
+    if not (_desk and target.is_agent()) or name in _PASSIVE:
+        return
+    first = res[0] if isinstance(res, list) and res else res
+    if isinstance(first, str) and first.startswith("error"):
+        text = first[:160]
+    elif name in _LOOKING:
+        text = _LOOKING[name]
+    else:
+        text = first.splitlines()[0][:160] if isinstance(first, str) and first else name
+        text = re.sub(r" -> screen \(\d+,\d+\)| in f\d+| \(.*?created.*?\)", "", text)
+    try:
+        path = os.path.join(agentdesk.RUN, f"{_desk.name}.activity")
+        with open(path + ".tmp", "w") as f:
+            json.dump({"t": time.time(), "tool": name, "text": text}, f)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
 
 
 def tool(**kw):
