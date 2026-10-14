@@ -1,0 +1,17 @@
+[project]
+name = "hypr-computer"
+version = "0.1.0"
+description = "Computer use for Hyprland/Wayland as an MCP server: screen, mouse, keyboard, gestures, OCR, accessibility, windows"
+requires-python = ">=3.12"
+# evdev, PyGObject (gi + Atspi) and Pillow come from the system Python (venv uses --system-site-packages).
+dependencies = ["mcp>=2.3"]
+
+[project.scripts]
+hypr-computer = "hypr_computer.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hypr_computer"]
