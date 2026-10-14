@@ -298,6 +298,12 @@ def start(name: str | None = None, width: int | None = None, height: int | None 
         place_viewer(d, viewer, index=idx)
         if not ensure_mirror(d):
             note = "the viewer is not mirroring the agent screen"
+    # New windows open on the focused monitor; that must be the headless screen, not the (mirroring) viewer.
+    for lua in (f'hl.dsp.focus({{monitor = "{HEADLESS}"}})', 'hl.dsp.focus({workspace = "1"})'):
+        try:
+            hypr.dispatch(lua, sig)
+        except HyprError:
+            pass
         now = (hypr.query("activewindow", host_sig) or {}).get("address")
         if host_active and now != host_active:
             try:
@@ -361,7 +367,7 @@ def viewer_window(d: Desk) -> dict | None:
         return None
 
 
-def _wait_viewer(d: Desk, host_before: set, timeout: float = 8) -> dict | None:
+def _wait_viewer(d: Desk, host_before: set, timeout: float = 20) -> dict | None:
     t0 = time.time()
     while time.time() - t0 < timeout:
         w = viewer_window(d)
@@ -392,6 +398,7 @@ def place_viewer(d: Desk, mode: str = "pip", scale: float = 0.5, corner: str = "
             ws = (hypr.query("activeworkspace", hs) or {}).get("name", "1")
             hypr.dispatch(f'hl.dsp.window.move({{workspace = {hypr.lua_str(ws)}, follow = false, window = {sel}}})', hs)
         a = hypr.eval_lua(f'return AgentPlaces and AgentPlaces.put("{w["address"]}", {d.place}) or nil', hs)
+        set_hands_on(d, False)
         if a is None:
             hypr.dispatch(f'hl.dsp.window.move({{workspace = "{d.place}", follow = false, window = {sel}}})', hs)
         return f"viewer fills place {place_label(d.place)} (Super+{place_label(d.place)} to watch)"
@@ -430,6 +437,21 @@ def place_viewer(d: Desk, mode: str = "pip", scale: float = 0.5, corner: str = "
         y = canvas.view_y + (y - canvas.anchor_y) / canvas.zoom
     hypr.dispatch(f"hl.dsp.window.move({{x = {int(x)}, y = {int(y)}, window = {sel}}})", hs)
     return f"viewer is a floating {vw}x{vh} window on the current place of {m['name']}"
+
+
+def set_hands_on(d: Desk, on: bool) -> str:
+    """Watch-only viewer (no focus: the user's mouse over it doesn't touch the agent's seat) or hands-on."""
+    w = viewer_window(d)
+    if not w:
+        return "no viewer window"
+    try:
+        hypr.eval_lua(f'return AgentPlaces and AgentPlaces.hands_on("{w["address"]}", {"true" if on else "false"})',
+                      d.host_sig)
+    except HyprError:
+        hypr.dispatch(f'hl.dsp.window.set_prop({{prop = "no_focus", value = "{0 if on else 1}", '
+                      f'window = "address:{w["address"]}"}})', d.host_sig)
+    return ("hands-on: the user can click and type in the agent desktop through the viewer" if on else
+            "watch-only: the user's mouse and keyboard don't reach the agent desktop")
 
 
 def _recreate_viewer(d: Desk):

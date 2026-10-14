@@ -34,10 +34,12 @@ the mouse, type, press any key combo, manage windows, read text (OCR) and operat
 the accessibility tree.
 
 By default you work on your OWN agent desktop: a separate Hyprland session with its own cursor,
-keyboard focus, clipboard and apps, started on first use. The user keeps using their computer
-undisturbed and watches you live in a small viewer window. Launch the apps you need there with
-launch(). Only switch to the user's real desktop (agent_desktop(action='use_host')) when the task
-needs their own open windows, and say so first: on the host you share their single mouse and keyboard.
+keyboard focus, clipboard, D-Bus and apps, started on first use. It lives on one of the user's desktop
+numbers 4-9/0 (1-3 are theirs): they press Super+N to watch you live, while they keep working
+undisturbed elsewhere. It starts empty: launch() the apps you need (browsers get a separate profile,
+so the user's logins aren't there; ask them to log in via agent_desktop(action='viewer', hands_on=true)
+if needed). Only switch to the user's real desktop (agent_desktop(action='use_host')) when the task
+needs their own open windows, and say so first: there you share their single mouse and keyboard.
 
 Coordinates: every screenshot/zoom returns a frame id (f1, f2, ...). x/y you pass to click, move,
 drag, scroll refer to the pixels of the most recent frame unless you pass frame= or coords='screen'
@@ -1175,6 +1177,9 @@ def agent_desktop(
     scale: Annotated[float, Field(description="viewer size relative to the agent screen (pip/window)")] = 0.5,
     corner: Annotated[Literal["bottom-right", "bottom-left", "top-right", "top-left"], Field(
         description="pip corner")] = "bottom-right",
+    hands_on: Annotated[bool | None, Field(description=(
+        "viewer: let the user click/type into the agent desktop through the viewer (true) or keep it "
+        "watch-only (false, default) so their mouse passing over it never disturbs you"))] = None,
 ):
     """Manage agent desktops: separate Hyprland sessions with their own cursor, keyboard focus, clipboard
     and apps, which the user watches in a live viewer window while using their own desktop."""
@@ -1211,6 +1216,8 @@ def agent_desktop(
         d = next((x for x in agentdesk.list_desks() if x.name == name), None) if name else _desk
         if d is None:
             return "no agent desktop running"
+        if hands_on is not None:
+            return agentdesk.set_hands_on(d, hands_on)
         return agentdesk.place_viewer(d, viewer, scale, corner)
     rows = ["places 1-3: the user's; 4-9 and 0: agent desktops",
             f"mode: {_mode}; tools act on: " + (f"agent desktop {_desk.name!r}" if target.is_agent() and _desk
