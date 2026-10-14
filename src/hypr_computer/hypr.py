@@ -15,9 +15,18 @@ class HyprError(RuntimeError):
     pass
 
 
-def _socket_path() -> str:
+_instance: str | None = None
+
+
+def set_instance(sig: str | None):
+    """Talk to this Hyprland instance (host session or an agent desktop) from now on."""
+    global _instance
+    _instance = sig or None
+
+
+def _socket_path(inst: str | None = None) -> str:
     run = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
-    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    sig = inst or _instance or os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
     if sig and os.path.exists(f"{run}/hypr/{sig}/.socket.sock"):
         return f"{run}/hypr/{sig}/.socket.sock"
     # Started outside the Hyprland session (no env): take the newest live instance.
@@ -30,12 +39,12 @@ def _socket_path() -> str:
 _lock = threading.Lock()
 
 
-def request(cmd: str, timeout: float = 10.0) -> str:
+def request(cmd: str, timeout: float = 10.0, inst: str | None = None) -> str:
     with _lock:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(timeout)
         try:
-            s.connect(_socket_path())
+            s.connect(_socket_path(inst))
             s.sendall(cmd.encode())
             chunks = []
             while True:
@@ -48,18 +57,18 @@ def request(cmd: str, timeout: float = 10.0) -> str:
     return b"".join(chunks).decode(errors="replace")
 
 
-def query(what: str):
+def query(what: str, inst: str | None = None):
     """JSON query: clients, monitors, workspaces, activewindow, activeworkspace, layers, devices, binds, ..."""
-    out = request("j/" + what)
+    out = request("j/" + what, inst=inst)
     try:
         return json.loads(out)
     except json.JSONDecodeError:
         raise HyprError(f"hyprctl {what}: {out.strip()}") from None
 
 
-def dispatch(lua: str) -> str:
+def dispatch(lua: str, inst: str | None = None) -> str:
     """Run a Lua dispatcher expression, e.g. hl.dsp.window.close()."""
-    out = request("dispatch " + lua).strip()
+    out = request("dispatch " + lua, inst=inst).strip()
     if out != "ok":
         raise HyprError(out)
     return out
@@ -96,7 +105,7 @@ end
 """
 
 
-def eval_lua(code: str):
+def eval_lua(code: str, inst: str | None = None):
     """Run Lua inside Hyprland and return its result (JSON-converted). `code` is a function body: use `return`."""
     fd, path = tempfile.mkstemp(prefix="hypr-computer-", suffix=".json", dir=os.environ.get("XDG_RUNTIME_DIR"))
     os.close(fd)
@@ -109,7 +118,7 @@ def eval_lua(code: str):
             + "else __f:write('{\"ok\":false,\"error\":' .. __enc(tostring(__res)) .. '}') end\n"
             + "__f:close()"
         )
-        out = request("eval " + wrapped).strip()
+        out = request("eval " + wrapped, inst=inst).strip()
         with open(path) as f:
             data = f.read()
         if not data:
@@ -125,8 +134,8 @@ def eval_lua(code: str):
             pass
 
 
-def cursor_pos() -> tuple[float, float]:
-    p = query("cursorpos")
+def cursor_pos(inst: str | None = None) -> tuple[float, float]:
+    p = query("cursorpos", inst)
     return float(p["x"]), float(p["y"])
 
 
@@ -160,7 +169,7 @@ class Canvas:
         return self.anchor_x + (x - self.view_x) * self.zoom, self.anchor_y + (y - self.view_y) * self.zoom
 
 
-def canvas_state(monitors: list[dict] | None = None) -> Canvas:
+def canvas_state(monitors: list[dict] | None = None, inst: str | None = None) -> Canvas:
     try:
         raw = eval_lua(
             """
@@ -169,7 +178,7 @@ def canvas_state(monitors: list[dict] | None = None) -> Canvas:
             local ok, v = pcall(so.view)
             local ok2, p = pcall(so.places)
             return { view = ok and v or nil, places = ok2 and p or nil }
-            """
+            """, inst
         )
     except HyprError:
         return Canvas(False)
@@ -177,7 +186,7 @@ def canvas_state(monitors: list[dict] | None = None) -> Canvas:
         return Canvas(False, raw=raw)
     view, places = raw["view"], raw["places"]
     if monitors is None:
-        monitors = query("monitors")
+        monitors = query("monitors", inst)
     mons = {m["name"]: m for m in monitors}
     screens = places.get("screens") or []
     anchor = None
@@ -191,7 +200,7 @@ def canvas_state(monitors: list[dict] | None = None) -> Canvas:
     # view() is the canvas rect shown by the screen under the pointer. All screens share one camera,
     # so derive the camera (canvas point at the anchor's layout origin) from that screen.
     try:
-        cx, cy = cursor_pos()
+        cx, cy = cursor_pos(inst)
     except HyprError:
         cx, cy = anchor
     scr_mon = monitor_for_point(monitors, cx, cy) or next(iter(mons.values()))
@@ -206,6 +215,11 @@ def window_screen_box(win: dict, canvas: Canvas) -> tuple[float, float, float, f
     x, y = canvas.to_layout(win["at"][0], win["at"][1])
     z = canvas.zoom if canvas.active else 1.0
     return x, y, win["size"][0] * z, win["size"][1] * z
+
+
+def screens(monitors: list[dict]) -> list[dict]:
+    """Enabled monitors that show their own content (mirrors, e.g. an agent desktop's viewer, excluded)."""
+    return [m for m in monitors if not m.get("disabled") and str(m.get("mirrorOf", "none")) in ("none", "", "None")]
 
 
 def monitor_for_point(monitors: list[dict], x: float, y: float) -> dict | None:

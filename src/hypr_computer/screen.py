@@ -16,7 +16,7 @@ from difflib import SequenceMatcher
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps
 
-from . import hypr
+from . import hypr, target
 
 # Claude downsizes images whose long edge exceeds ~1568px or that exceed ~1.15 megapixels. Staying
 # under both keeps the image the model sees identical to the frame we map coordinates through.
@@ -104,7 +104,7 @@ def grab(box: tuple[float, float, float, float] | None = None, output: str | Non
         x, y, w, h = box
         args += ["-g", f"{round(x)},{round(y)} {max(1, round(w))}x{max(1, round(h))}"]
     args.append("-")
-    r = subprocess.run(args, capture_output=True, timeout=15)
+    r = subprocess.run(args, capture_output=True, timeout=15, env=target.env())
     if r.returncode:
         raise ScreenError(f"grim failed: {r.stderr.decode().strip()}")
     return Image.open(io.BytesIO(r.stdout)).convert("RGB")

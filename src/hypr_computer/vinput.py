@@ -127,6 +127,15 @@ class VirtualInput:
         self.created_note: str | None = None
         atexit.register(self.close)
 
+    guard_lock = True  # the host session: never type into its lock screen
+
+    def _check_lock(self):
+        if self.guard_lock:
+            ensure_unlocked()
+
+    def _wtype(self, text: str, delay: float):
+        _wtype(text, delay, None, True)
+
     # ------------------------------------------------------------ devices
 
     def _restore_focus_after_hotplug(self, before: dict | None):
@@ -221,7 +230,7 @@ class VirtualInput:
     def resolve(self, combo: str) -> list[Stroke]:
         """'ctrl+shift+t' -> strokes. Returns a single chord as [Stroke(main, mods)]; a combo that is
         only modifiers ('super') becomes a stroke of the last modifier."""
-        ensure_unlocked()
+        self._check_lock()
         self.kbd  # ensures keymap
         tokens = _split_combo(combo)
         if not tokens:
@@ -264,7 +273,7 @@ class VirtualInput:
         raise InputError(f"unknown key {tok!r}")
 
     def key_down(self, code: int):
-        ensure_unlocked()
+        self._check_lock()
         self.kbd.write(e.EV_KEY, code, 1)
         self.kbd.syn()
         self.held_keys.add(code)
@@ -317,7 +326,7 @@ class VirtualInput:
         """Type text. auto = real key events for everything on the layout, wtype for the rest."""
         delay = self.key_delay if delay is None else delay
         if method == "wtype":
-            _wtype(text, delay)
+            self._wtype(text, delay)
             return "wtype"
         self.kbd
         km = self.keymap
@@ -326,7 +335,7 @@ class VirtualInput:
 
         def flush():
             if run:
-                _wtype("".join(run), delay)
+                self._wtype("".join(run), delay)
                 run.clear()
                 used.add("wtype")
 
@@ -353,7 +362,7 @@ class VirtualInput:
     def move_to(self, x: float, y: float, duration: float = 0.15, steps: int | None = None):
         """Move the pointer to layout coords with real relative motion events (hover, drag targets,
         canvas input hooks all see it), then correct any residual exactly with a warp."""
-        ensure_unlocked()
+        self._check_lock()
         with self._lock:
             ptr = self.ptr
             cx, cy = hypr.cursor_pos()
@@ -391,7 +400,7 @@ class VirtualInput:
         if code is None:
             raise InputError(f"unknown button {name!r}; use one of {', '.join(BUTTONS)}")
         if down:
-            ensure_unlocked()
+            self._check_lock()
         with self._lock:
             self.ptr.write(e.EV_KEY, code, 1 if down else 0)
             self.ptr.syn()
@@ -408,7 +417,7 @@ class VirtualInput:
     def scroll(self, dy: float = 0.0, dx: float = 0.0, step_delay: float = 0.03):
         """dy > 0 scrolls down (content moves up, like a wheel turned towards you), dx > 0 scrolls right.
         Units are wheel notches; fractions use hi-res events."""
-        ensure_unlocked()
+        self._check_lock()
         with self._lock:
             ptr = self.ptr
             for axis_lo, axis_hi, amount, sign in ((e.REL_WHEEL, e.REL_WHEEL_HI_RES, dy, -1),
@@ -433,7 +442,7 @@ class VirtualInput:
                 rotate: float = 0.0, duration: float = 0.35, hold_end: float = 0.0):
         """Multi-finger touchpad gesture. dx/dy in fraction of pad size for swipes (1.0 = full width).
         pinch: scale > 1 spreads fingers (zoom in), < 1 pinches together; rotate in degrees."""
-        ensure_unlocked()
+        self._check_lock()
         fingers = max(1, min(5, fingers))
         pad = self.pad
         W, H = self._pad_size
@@ -538,11 +547,12 @@ def _safe_active():
         return None
 
 
-def _wtype(text: str, delay: float):
-    ensure_unlocked()
+def _wtype(text: str, delay: float, env: dict | None = None, guard: bool = True):
+    if guard:
+        ensure_unlocked()
     if not shutil.which("wtype"):
         raise InputError("wtype is not installed; cannot type characters outside the keyboard layout")
     args = ["wtype", "-d", str(max(0, int(delay * 1000))), "--", text]
-    r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+    r = subprocess.run(args, capture_output=True, text=True, timeout=60, env=env)
     if r.returncode:
         raise InputError(f"wtype failed: {r.stderr.strip()}")

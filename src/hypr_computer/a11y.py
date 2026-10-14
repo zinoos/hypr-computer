@@ -430,3 +430,70 @@ def _fmt(role, name, info) -> str:
     if info["flags"]:
         s += " (" + ", ".join(info["flags"]) + ")"
     return s
+
+
+# ---------------------------------------------------------------- per-bus worker process
+#
+# libatspi binds to one session bus per process, and every agent desktop has its own bus. The server
+# talks to one worker process per bus over JSON lines.
+
+class A11yProxy:
+    METHODS = ("ensure_enabled", "apps", "tree", "screen_box", "act", "info")
+
+    def __init__(self, env: dict):
+        import subprocess
+        import sys
+        self._env = env
+        self._lock = threading.Lock()
+        self._p = subprocess.Popen([sys.executable, "-m", "hypr_computer.a11y"], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env, text=True, bufsize=1)
+
+    def _call(self, method, *a, **kw):
+        import json
+        with self._lock:
+            if self._p.poll() is not None:
+                raise A11yError("accessibility worker exited")
+            self._p.stdin.write(json.dumps({"m": method, "a": a, "k": kw}) + "\n")
+            self._p.stdin.flush()
+            line = self._p.stdout.readline()
+        if not line:
+            raise A11yError("accessibility worker died")
+        res = json.loads(line)
+        if "err" in res:
+            raise A11yError(res["err"])
+        r = res["r"]
+        return tuple(r) if method == "screen_box" and r else r
+
+    def __getattr__(self, name):
+        if name in A11yProxy.METHODS:
+            return lambda *a, **kw: self._call(name, *a, **kw)
+        raise AttributeError(name)
+
+    @property
+    def enabled_note(self):
+        return None
+
+    def close(self):
+        try:
+            self._p.kill()
+        except Exception:
+            pass
+
+
+def _worker():
+    import json
+    import sys
+    ax = A11y()
+    for line in sys.stdin:
+        try:
+            req = json.loads(line)
+            r = getattr(ax, req["m"])(*req.get("a", []), **req.get("k", {}))
+            out = {"r": r}
+        except Exception as ex:
+            out = {"err": str(ex) if isinstance(ex, (A11yError, hypr.HyprError)) else f"{type(ex).__name__}: {ex}"}
+        sys.stdout.write(json.dumps(out, default=str) + "\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    _worker()

@@ -17,17 +17,27 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.types import Image
 from pydantic import Field
 
-from . import hypr
-from .a11y import A11y, A11yError
+import threading
+
+from . import agentdesk, hypr, target
+from .a11y import A11y, A11yError, A11yProxy
+from .agentdesk import AgentDeskError
+from .agentinput import AgentInput
 from .hypr import HyprError
 from .screen import Frame, Frames, ScreenError
 from . import screen as scr
 from .vinput import InputError, VirtualInput, session_locked
 
 INSTRUCTIONS = """\
-Drive the user's Hyprland desktop like a person at the keyboard: see the screen, move/click/drag/scroll
-the mouse, type, press any key combo (including compositor binds like super+1), do touchpad gestures,
-manage windows, read text (OCR) and operate widgets through the accessibility tree.
+Use a Linux (Hyprland) desktop like a person at the keyboard: see the screen, move/click/drag/scroll
+the mouse, type, press any key combo, manage windows, read text (OCR) and operate widgets through
+the accessibility tree.
+
+By default you work on your OWN agent desktop: a separate Hyprland session with its own cursor,
+keyboard focus, clipboard and apps, started on first use. The user keeps using their computer
+undisturbed and watches you live in a small viewer window. Launch the apps you need there with
+launch(). Only switch to the user's real desktop (agent_desktop(action='use_host')) when the task
+needs their own open windows, and say so first: on the host you share their single mouse and keyboard.
 
 Coordinates: every screenshot/zoom returns a frame id (f1, f2, ...). x/y you pass to click, move,
 drag, scroll refer to the pixels of the most recent frame unless you pass frame= or coords='screen'
@@ -37,18 +47,70 @@ index= to pick among several) or ref='e12' (an element from a11y_tree) or ref='t
 Good loop: screenshot -> act (with screenshot_after=true to see the result) -> verify.
 Prefer a11y_tree + a11y_act for apps that expose accessibility (GTK, Qt, LibreOffice, Firefox):
 it's exact and needs no pixels. Use zoom on small UI before clicking tiny targets.
-The user may be using the machine: keep actions purposeful, and stop if they take over.
+On the host desktop the user may be using the machine: keep actions purposeful, stop if they take over.
 """
 
 mcp = MCPServer("hypr-computer", instructions=INSTRUCTIONS)
 frames = Frames()
-vin = VirtualInput()
-ax = A11y()
+_host_input = VirtualInput()
+_host_a11y = A11y()
+_desk: agentdesk.Desk | None = None
+_desk_input: AgentInput | None = None
+_desk_a11y: A11yProxy | None = None
+_mode = os.environ.get("HYPR_COMPUTER_TARGET", "agent")  # "agent" | "host"
+_tool_lock = threading.RLock()
 _ocr_hits: dict[str, scr.TextHit] = {}
 _ocr_counter = [0]
 _ocr_cache: dict[tuple, list] = {}
 
 Coords = Literal["image", "screen"]
+
+
+# ====================================================================== targets
+
+
+def V() -> VirtualInput:
+    return _desk_input if (target.is_agent() and _desk_input) else _host_input
+
+
+def AX():
+    global _desk_a11y
+    if target.is_agent() and _desk:
+        if _desk_a11y is None or _desk_a11y._p.poll() is not None:
+            _desk_a11y = A11yProxy(_desk.env)
+        return _desk_a11y
+    return _host_a11y
+
+
+def _use_desk(d: agentdesk.Desk):
+    global _desk, _desk_input, _desk_a11y
+    if _desk_input:
+        _desk_input.close()
+    if _desk_a11y:
+        _desk_a11y.close()
+        _desk_a11y = None
+    _desk = d
+    layout, variant = agentdesk._host_keyboard(d.host_sig)
+    _desk_input = AgentInput(d.wl_socket, d.env, layout, variant, (0, 0, d.width, d.height))
+    target.activate(target.Target("agent", d.name, d.wl_socket, d.sig, d.dbus))
+    frames.last = None
+
+
+def _ensure_target() -> str | None:
+    """In agent mode, make sure our agent desktop runs (start or adopt one). Returns a note on start."""
+    global _desk
+    if _mode != "agent":
+        if target.is_agent():
+            target.activate(target.host())
+        return None
+    if _desk and _desk.alive():
+        if not target.is_agent():
+            target.activate(target.Target("agent", _desk.name, _desk.wl_socket, _desk.sig, _desk.dbus))
+        return None
+    h = target.host()
+    d, note = agentdesk.start(host_sig=h.hypr_sig, host_wayland=h.wayland_display)
+    _use_desk(d)
+    return note + ". You are on your own agent desktop (empty at first); launch apps there with launch()."
 
 
 # ====================================================================== helpers
@@ -59,7 +121,7 @@ def _err(ex: Exception) -> str:
 
 
 def _monitors() -> list[dict]:
-    return [m for m in hypr.query("monitors") if not m.get("disabled")]
+    return hypr.screens(hypr.query("monitors"))
 
 
 def _focused_monitor(mons: list[dict]) -> dict:
@@ -166,7 +228,7 @@ def _resolve_point(x: float | None = None, y: float | None = None, ref: str | No
             bx, by, bw, bh = h.box
             return bx + bw / 2, by + bh / 2, f"OCR hit {ref} {h.text!r}"
         if ref.startswith("e"):
-            box = ax.screen_box(ref)
+            box = AX().screen_box(ref)
             if box is None:
                 raise A11yError(f"{ref} has no usable on-screen position (toolkit doesn't report it); "
                                 f"use a11y_act(ref='{ref}', action='click') instead")
@@ -236,17 +298,17 @@ def _with_mods(modifiers: list[str] | None):
         def __enter__(self_inner):
             self_inner.combo = "+".join(modifiers) if modifiers else None
             if self_inner.combo:
-                vin.hold_combo(self_inner.combo, True)
+                V().hold_combo(self_inner.combo, True)
 
         def __exit__(self_inner, *a):
             if self_inner.combo:
-                vin.hold_combo(self_inner.combo, False)
+                V().hold_combo(self_inner.combo, False)
     return _Ctx()
 
 
 def _note() -> str:
-    n = vin.created_note
-    vin.created_note = None
+    n = V().created_note
+    V().created_note = None
     return f" ({n})" if n else ""
 
 
@@ -256,13 +318,21 @@ def _guard(fn):
 
     @functools.wraps(fn)
     def wrapper(*a, **kw):
+        with _tool_lock:
+            return _run(*a, **kw)
+
+    def _run(*a, **kw):
         try:
-            return fn(*a, **kw)
-        except (HyprError, ScreenError, InputError, A11yError, ValueError, TimeoutError) as ex:
-            rel = vin.release_all()
+            note = None if fn.__name__ == "agent_desktop" else _ensure_target()
+            res = fn(*a, **kw)
+            if note:
+                res = [note] + (res if isinstance(res, list) else [res])
+            return res
+        except (HyprError, ScreenError, InputError, A11yError, AgentDeskError, ValueError, TimeoutError) as ex:
+            rel = V().release_all()
             return _err(ex) + (f" (released held: {', '.join(rel)})" if rel else "")
         except Exception as ex:
-            rel = vin.release_all()
+            rel = V().release_all()
             return f"error: {type(ex).__name__}: {ex}" + (f" (released held: {', '.join(rel)})" if rel else "")
     return wrapper
 
@@ -408,9 +478,9 @@ def click(
 ):
     """Move the mouse to a target and click it (any button, multi-click, with held modifiers)."""
     lx, ly, what = _resolve_point(x, y, ref, text, index, frame, coords, within)
-    vin.move_to(lx, ly)
+    V().move_to(lx, ly)
     with _with_mods(modifiers):
-        vin.click(button, count)
+        V().click(button, count)
     mods = "+".join(modifiers) + "+" if modifiers else ""
     return [f"{mods}{button} click x{count} at {what} -> screen ({round(lx)},{round(ly)}){_note()}"] + \
         _after(screenshot_after, wait_ms)
@@ -425,7 +495,7 @@ def move_mouse(
 ):
     """Move the pointer (hover: tooltips, menus, focus-follows-mouse, edge triggers)."""
     lx, ly, what = _resolve_point(x, y, ref, text, index, frame, coords, within)
-    vin.move_to(lx, ly, duration=duration_ms / 1000)
+    V().move_to(lx, ly, duration=duration_ms / 1000)
     return [f"pointer at {what} -> screen ({round(lx)},{round(ly)}){_note()}"] + _after(screenshot_after, wait_ms)
 
 
@@ -451,7 +521,7 @@ def drag(
     (e.g. modifiers=['super'] to move a window, button='right' + super to resize)."""
     if from_x is not None or from_ref or from_text:
         sx, sy, swhat = _resolve_point(from_x, from_y, from_ref, from_text, 1, frame, coords)
-        vin.move_to(sx, sy)
+        V().move_to(sx, sy)
     else:
         sx, sy = hypr.cursor_pos()
         swhat = "pointer"
@@ -463,16 +533,16 @@ def drag(
     pts.append((tx, ty))
     seg = max(0.05, duration_ms / 1000 / len(pts))
     with _with_mods(modifiers):
-        vin.button(button, True)
+        V().button(button, True)
         try:
             time.sleep(hold_ms / 1000)
             # Get past drag thresholds first with a small move.
-            vin.move_to(sx + (4 if tx >= sx else -4), sy + (4 if ty >= sy else -4), duration=0.05)
+            V().move_to(sx + (4 if tx >= sx else -4), sy + (4 if ty >= sy else -4), duration=0.05)
             for px, py in pts:
-                vin.move_to(px, py, duration=seg)
+                V().move_to(px, py, duration=seg)
             time.sleep(hold_ms / 1000)
         finally:
-            vin.button(button, False)
+            V().button(button, False)
     return [f"dragged {button} from {swhat} to {twhat} -> screen ({round(tx)},{round(ty)}){_note()}"] + \
         _after(screenshot_after, wait_ms)
 
@@ -491,11 +561,11 @@ def scroll(
     where = "pointer"
     if x is not None or ref or text:
         lx, ly, where = _resolve_point(x, y, ref, text, 1, frame, coords)
-        vin.move_to(lx, ly)
+        V().move_to(lx, ly)
     dy = amount if direction == "down" else -amount if direction == "up" else 0
     dx = amount if direction == "right" else -amount if direction == "left" else 0
     with _with_mods(modifiers):
-        vin.scroll(dy=dy, dx=dx)
+        V().scroll(dy=dy, dx=dx)
     return [f"scrolled {direction} {amount} at {where}{_note()}"] + _after(screenshot_after, wait_ms)
 
 
@@ -505,7 +575,7 @@ def mouse_button(
     button: Literal["left", "right", "middle", "back", "forward"] = "left",
 ):
     """Low-level: hold or release a mouse button (combine with move_mouse for custom drags)."""
-    vin.button(button, action == "down")
+    V().button(button, action == "down")
     return f"{button} {action}{_note()}"
 
 
@@ -527,15 +597,15 @@ def type_text(
         old = _clip_get_bytes()
         _clip_set(text)
         time.sleep(0.05)
-        vin.press_combo("ctrl+v")
+        V().press_combo("ctrl+v")
         time.sleep(0.15)
         if old is not None:
             _clip_restore(old)
         used = "paste"
     else:
-        used = vin.type_text(text, method, delay_ms / 1000)
+        used = V().type_text(text, method, delay_ms / 1000)
     if submit:
-        vin.press_combo("Return")
+        V().press_combo("Return")
     return [f"typed {len(text)} chars via {used}{' + Enter' if submit else ''}{_note()}"] + \
         _after(screenshot_after, wait_ms)
 
@@ -555,7 +625,7 @@ def key(
     chords = keys.split() if keys.strip() not in ("+", " ") else [keys.strip()]
     for _ in range(max(1, repeat)):
         for c in chords:
-            vin.press_combo(c, hold=hold_ms / 1000 if hold_ms else None)
+            V().press_combo(c, hold=hold_ms / 1000 if hold_ms else None)
     return [f"pressed {keys}" + (f" x{repeat}" if repeat > 1 else "") + _note()] + _after(screenshot_after, wait_ms)
 
 
@@ -566,21 +636,21 @@ def hold_key(
 ):
     """Low-level: keep keys held across other actions (e.g. hold shift while clicking, hold w in a game).
     Always release afterwards (release_all does everything)."""
-    vin.hold_combo(keys, action == "down")
+    V().hold_combo(keys, action == "down")
     return f"{keys} {action}; held now: {sorted(_held_names())}{_note()}"
 
 
 @tool()
 def release_all():
     """Release every key and mouse button this server is holding (safety reset)."""
-    rel = vin.release_all()
+    rel = V().release_all()
     return f"released: {', '.join(rel) if rel else 'nothing was held'}"
 
 
 def _held_names():
     from evdev import ecodes as e
     out = []
-    for c in vin.held_keys:
+    for c in V().held_keys:
         n = e.KEY.get(c, c)
         out.append(n[0] if isinstance(n, list) else n)
     return out
@@ -607,7 +677,7 @@ def gesture(
             raise InputError("swipe needs direction")
         dx = {"left": -distance, "right": distance}.get(direction, 0.0)
         dy = {"up": -distance, "down": distance}.get(direction, 0.0)
-    vin.gesture(kind, fingers, dx, dy, scale, rotate, duration_ms / 1000)
+    V().gesture(kind, fingers, dx, dy, scale, rotate, duration_ms / 1000)
     return [f"{fingers}-finger {kind} {direction or ''}{_note()}"] + _after(screenshot_after, wait_ms)
 
 
@@ -636,7 +706,7 @@ def actions(
         if expected is not None and stop_if_user_moves:
             cx, cy = hypr.cursor_pos()
             if abs(cx - expected[0]) > 3 or abs(cy - expected[1]) > 3:
-                vin.release_all()
+                V().release_all()
                 log.append(f"{i}. stopped: the pointer moved by itself (user took over?)")
                 break
         if name == "wait":
@@ -740,7 +810,9 @@ def desktop():
     """Overview of the desktop: monitors, workspaces, focused window, pointer, canvas camera, layer
     surfaces (bars, launchers, notifications), keyboard layout and submap."""
     mons = _monitors()
-    out = ["Monitors (layout coords):"]
+    out = [f"Acting on: agent desktop {_desk.name!r} (own cursor/keyboard; the user watches in a viewer)"
+           if target.is_agent() and _desk else "Acting on: the user's real desktop (host)"]
+    out.append("Monitors (layout coords):")
     for m in mons:
         x, y, w, h = hypr.monitor_box(m)
         out.append(f"  {m['name']} {m.get('description', '')[:40]!r} at {round(x)},{round(y)} {round(w)}x{round(h)} "
@@ -787,7 +859,7 @@ def launch(
         raise ValueError("give command or app")
     env_prefix = ""
     if accessibility:
-        ax.ensure_enabled()
+        AX().ensure_enabled()
         env_prefix = "env QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 ACCESSIBILITY_ENABLED=1 "
     if app:
         entry = _find_desktop_entry(app)
@@ -800,9 +872,12 @@ def launch(
         label = command
     if accessibility and re.search(r"chrom|electron|code|brave|edge|slack|discord|obsidian", cmd, re.I):
         cmd += " --force-renderer-accessibility"
+    isolated = ""
+    if target.is_agent() and _desk:
+        cmd, isolated = _isolate_profile(cmd, _desk)
     before = {c["address"] for c in hypr.query("clients")}
     hypr.dispatch(f"hl.dsp.exec_cmd({hypr.lua_str(env_prefix + cmd)})")
-    msg = f"launched {label}"
+    msg = f"launched {label}" + (f" on agent desktop {_desk.name!r}" if target.is_agent() and _desk else "") + isolated
     if wait_for_window:
         t0 = time.time()
         while time.time() - t0 < 10:
@@ -815,6 +890,34 @@ def launch(
         else:
             msg += "; no new window within 10 s (it may reuse an existing one or still be starting)"
     return [msg] + _after(screenshot_after, wait_ms)
+
+
+_CHROMIUM = re.compile(r"(google-chrome|chromium|brave|microsoft-edge|vivaldi|code|codium|electron)[\w-]*$")
+
+
+def _isolate_profile(cmd: str, d: agentdesk.Desk) -> tuple[str, str]:
+    """Apps that keep one process per profile would open their window in the user's running instance on
+    the host desktop. Give them a profile of their own on the agent desktop."""
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return cmd, ""
+    i = 1 if parts and parts[0] == "env" else 0
+    while i < len(parts) and "=" in parts[i] and parts[0] == "env":
+        i += 1
+    if i >= len(parts):
+        return cmd, ""
+    exe = os.path.basename(parts[i])
+    if _CHROMIUM.match(exe) and not any(a.startswith("--user-data-dir") for a in parts):
+        prof = os.path.join(d.state_dir, f"profile-{exe}")
+        return cmd + f" --user-data-dir={shlex.quote(prof)} --ozone-platform=wayland", \
+            f" (separate {exe} profile for the agent: the user's logins are not available there)"
+    if exe in ("firefox", "firefox-esr", "librewolf", "zen", "zen-browser") and "-profile" not in parts:
+        prof = os.path.join(d.state_dir, f"profile-{exe}")
+        os.makedirs(prof, exist_ok=True)
+        return cmd + f" --no-remote --profile {shlex.quote(prof)}", \
+            f" (separate {exe} profile for the agent: the user's logins are not available there)"
+    return cmd, ""
 
 
 def _desktop_dirs():
@@ -898,8 +1001,8 @@ def a11y_tree(
 ):
     """Widget tree of a window via AT-SPI: every button, field, menu item, tab, link... with refs (e12).
     Act on them with a11y_act (exact, no pixels) or click(ref='e12')."""
-    note = ax.ensure_enabled()
-    res = ax.tree(window=window, app=app, query=query, role=role, interactive_only=interactive_only,
+    note = AX().ensure_enabled()
+    res = AX().tree(window=window, app=app, query=query, role=role, interactive_only=interactive_only,
                   max_nodes=max_nodes)
     return (note + "\n" if note else "") + res
 
@@ -916,18 +1019,18 @@ def a11y_act(
     """Operate a widget directly through accessibility: press buttons, toggle checkboxes, fill fields,
     pick list items, expand trees, read text. Works even if the widget is covered."""
     try:
-        msg = ax.act(ref, action, value)
+        msg = AX().act(ref, action, value)
     except A11yError as ex:
         # Some toolkits (GTK4 check boxes, many custom widgets) export no actions: fall back to the mouse.
         if action.lower() not in ("click", "press", "activate", "default", "toggle", "open", "invoke") \
                 or "no actions" not in str(ex):
             raise
-        box = ax.screen_box(ref)
+        box = AX().screen_box(ref)
         if box is None:
             raise A11yError(f"{ref} has no actions and no on-screen position; click it from a screenshot") from None
         bx, by, bw, bh = box
-        vin.move_to(bx + bw / 2, by + bh / 2)
-        vin.click("left")
+        V().move_to(bx + bw / 2, by + bh / 2)
+        V().click("left")
         msg = f"{ref} has no a11y actions; clicked its center at screen ({round(bx + bw / 2)},{round(by + bh / 2)}){_note()}"
     return [msg] + _after(screenshot_after, wait_ms)
 
@@ -935,8 +1038,8 @@ def a11y_act(
 @tool()
 def a11y_apps():
     """Applications currently exposing an accessibility tree."""
-    note = ax.ensure_enabled()
-    rows = [f"{a['name']} pid={a['pid']}: {', '.join(a['toplevels']) or '(no windows)'}" for a in ax.apps()]
+    note = AX().ensure_enabled()
+    rows = [f"{a['name']} pid={a['pid']}: {', '.join(a['toplevels']) or '(no windows)'}" for a in AX().apps()]
     return (note + "\n" if note else "") + "\n".join(rows)
 
 
@@ -946,24 +1049,25 @@ def a11y_apps():
 def _clip_get_bytes(primary: bool = False) -> tuple[str, bytes] | None:
     args = ["wl-paste", "--no-newline"] + (["--primary"] if primary else [])
     types = subprocess.run(args[:1] + ["--list-types"] + (["--primary"] if primary else []),
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=5, env=target.env())
     if types.returncode:
         return None
     tlist = types.stdout.split()
     mime = next((t for t in tlist if t.startswith("text/plain")), None) or (tlist[0] if tlist else None)
     if not mime:
         return None
-    r = subprocess.run(args + ["--type", mime], capture_output=True, timeout=5)
+    r = subprocess.run(args + ["--type", mime], capture_output=True, timeout=5, env=target.env())
     return (mime, r.stdout) if r.returncode == 0 else None
 
 
 def _clip_set(text: str, primary: bool = False):
-    subprocess.run(["wl-copy"] + (["--primary"] if primary else []), input=text.encode(), timeout=5, check=True)
+    subprocess.run(["wl-copy"] + (["--primary"] if primary else []), input=text.encode(), timeout=5, check=True,
+                   env=target.env())
 
 
 def _clip_restore(old: tuple[str, bytes]):
     mime, data = old
-    subprocess.run(["wl-copy", "--type", mime], input=data, timeout=5)
+    subprocess.run(["wl-copy", "--type", mime], input=data, timeout=5, env=target.env())
 
 
 @tool()
@@ -977,7 +1081,7 @@ def clipboard(
         _clip_set(text or "", primary)
         return f"clipboard set ({len(text or '')} chars)"
     r = subprocess.run(["wl-paste", "--list-types"] + (["--primary"] if primary else []),
-                       capture_output=True, text=True, timeout=5)
+                       capture_output=True, text=True, timeout=5, env=target.env())
     tlist = r.stdout.split()
     if action == "types":
         return "offered types: " + (", ".join(tlist) or "(empty)")
@@ -985,10 +1089,10 @@ def clipboard(
     txt_t = next((t for t in tlist if t.startswith("text/plain") or t in ("UTF8_STRING", "STRING", "TEXT")), None)
     if txt_t:
         out = subprocess.run(["wl-paste", "--no-newline", "--type", txt_t] + (["--primary"] if primary else []),
-                             capture_output=True, timeout=5).stdout.decode(errors="replace")
+                             capture_output=True, timeout=5, env=target.env()).stdout.decode(errors="replace")
         return out if len(out) < 50000 else out[:50000] + f"\n... ({len(out)} chars total)"
     if img_t:
-        data = subprocess.run(["wl-paste", "--type", img_t], capture_output=True, timeout=5).stdout
+        data = subprocess.run(["wl-paste", "--type", img_t], capture_output=True, timeout=5, env=target.env()).stdout
         img = scr.Image.open(__import__("io").BytesIO(data)).convert("RGB")
         tw, th = scr.fit_size(img.width, img.height)
         data2, kind = scr.encode(img.resize((tw, th)) if (tw, th) != img.size else img)
@@ -1049,6 +1153,95 @@ def wait(
         time.sleep(0.3 if not (until_text or until_text_gone) else 0.1)
 
 
+# ====================================================================== agent desktops
+
+
+@tool()
+def agent_desktop(
+    action: Annotated[Literal["status", "start", "stop", "viewer", "use_host", "use_agent"], Field(description=(
+        "status: where tools act + all agent desktops. start: start/attach an agent desktop (name= to pick one). "
+        "stop: shut one down (its apps close). viewer: change how the user sees it. "
+        "use_host: act on the user's real desktop (shared mouse/keyboard!). use_agent: back to the agent desktop."))] = "status",
+    name: Annotated[str | None, Field(description="agent desktop name (default: this session's)")] = None,
+    place: Annotated[int | None, Field(description=(
+        "start: which of the user's desktops (Super+N) the agent gets: 4-9 or 0. Default: the first free one. "
+        "1-3 are the user's"))] = None,
+    width: Annotated[int | None, Field(description="start: screen width (default: fills the place)")] = None,
+    height: Annotated[int | None, Field(description="start: screen height")] = None,
+    viewer: Annotated[Literal["place", "pip", "window", "tile", "hidden"], Field(description=(
+        "place: full-size live view on its desktop number (Super+N shows it); pip: small always-visible "
+        "picture-in-picture; window: floating window on the user's current place; tile: let the tiler place it; "
+        "hidden: tucked into special workspace 'agents'"))] = "place",
+    scale: Annotated[float, Field(description="viewer size relative to the agent screen (pip/window)")] = 0.5,
+    corner: Annotated[Literal["bottom-right", "bottom-left", "top-right", "top-left"], Field(
+        description="pip corner")] = "bottom-right",
+):
+    """Manage agent desktops: separate Hyprland sessions with their own cursor, keyboard focus, clipboard
+    and apps, which the user watches in a live viewer window while using their own desktop."""
+    global _mode
+    h = target.host()
+    if action == "use_host":
+        _mode = "host"
+        target.activate(h)
+        frames.last = None
+        return ("now acting on the USER'S real desktop: you share their mouse and keyboard, and input is "
+                "refused while their screen is locked. agent_desktop(action='use_agent') goes back.")
+    if action == "use_agent":
+        _mode = "agent"
+        note = _ensure_target()
+        return note or f"acting on agent desktop {_desk.name!r}"
+    if action == "start":
+        if _desk and _desk.alive() and name in (None, _desk.name) and place in (None, _desk.place):
+            _mode = "agent"
+            target.activate(target.Target("agent", _desk.name, _desk.wl_socket, _desk.sig, _desk.dbus))
+            return f"already on agent desktop {_desk.name!r}"
+        d, note = agentdesk.start(name, width, height, viewer, h.hypr_sig, h.wayland_display, place)
+        _use_desk(d)
+        _mode = "agent"
+        return note
+    if action == "stop":
+        d = next((x for x in agentdesk.list_desks() if x.name == name), None) if name else _desk
+        if d is None:
+            return "no such agent desktop"
+        msg = agentdesk.stop(d)
+        if _desk and d.name == _desk.name:
+            _use_host_after_stop()
+        return msg
+    if action == "viewer":
+        d = next((x for x in agentdesk.list_desks() if x.name == name), None) if name else _desk
+        if d is None:
+            return "no agent desktop running"
+        return agentdesk.place_viewer(d, viewer, scale, corner)
+    rows = ["places 1-3: the user's; 4-9 and 0: agent desktops",
+            f"mode: {_mode}; tools act on: " + (f"agent desktop {_desk.name!r}" if target.is_agent() and _desk
+                                                  else "the user's real desktop (host)")]
+    for d in agentdesk.list_desks():
+        w = agentdesk.viewer_window(d)
+        vstate = "no viewer" if not w else ("hidden" if w["workspace"]["name"].startswith("special")
+                                            else "pip" if w["pinned"] else "on its place" if d.place else "window")
+        mine = " (this session)" if _desk and d.name == _desk.name else \
+            ("" if agentdesk._alive(d.owner_pid) else " (unowned: start() adopts it)")
+        try:
+            n = len(hypr.query("clients", d.sig))
+        except HyprError:
+            n = "?"
+        where = f"place {agentdesk.place_label(d.place)}, " if d.place else ""
+        rows.append(f"  {d.name}{mine}: {where}{d.width}x{d.height}, {n} windows, viewer {vstate}, "
+                    f"up {int(time.time() - d.created)}s")
+    return "\n".join(rows)
+
+
+def _use_host_after_stop():
+    global _desk, _desk_input, _desk_a11y
+    if _desk_input:
+        _desk_input.close()
+    if _desk_a11y:
+        _desk_a11y.close()
+    _desk, _desk_input, _desk_a11y = None, None, None
+    target.activate(target.host())
+    frames.last = None
+
+
 # ====================================================================== escape hatch
 
 
@@ -1082,8 +1275,10 @@ def _session_env():
     run = os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     if "WAYLAND_DISPLAY" not in os.environ or "HYPRLAND_INSTANCE_SIGNATURE" not in os.environ:
         try:
-            inst = max(json.loads(subprocess.run(["hyprctl", "instances", "-j"], capture_output=True,
-                                                 text=True, timeout=5).stdout), key=lambda i: i["time"])
+            agents = {d.pid for d in agentdesk.list_desks()}  # never mistake an agent desktop for the host
+            insts = [i for i in json.loads(subprocess.run(["hyprctl", "instances", "-j"], capture_output=True,
+                                                          text=True, timeout=5).stdout) if i["pid"] not in agents]
+            inst = max(insts, key=lambda i: i["time"])
             os.environ.setdefault("HYPRLAND_INSTANCE_SIGNATURE", inst["instance"])
             os.environ.setdefault("WAYLAND_DISPLAY", inst["wl_socket"])
         except Exception:
