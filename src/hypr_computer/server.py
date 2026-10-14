@@ -22,7 +22,7 @@ from .a11y import A11y, A11yError
 from .hypr import HyprError
 from .screen import Frame, Frames, ScreenError
 from . import screen as scr
-from .vinput import InputError, VirtualInput
+from .vinput import InputError, VirtualInput, session_locked
 
 INSTRUCTIONS = """\
 Drive the user's Hyprland desktop like a person at the keyboard: see the screen, move/click/drag/scroll
@@ -150,6 +150,9 @@ def _make_frame(img, box, label, grid: bool = False, max_size: int | None = None
             f"Coordinates you pass now refer to this image.")
     if cpos:
         desc += f" Mouse cursor is at ({round(cpos[0])}, {round(cpos[1])}) in this image."
+    locker = session_locked()
+    if locker:
+        desc += f" NOTE: the session is LOCKED ({locker}); input is refused until the user unlocks."
     return f, [desc, Image(data=data, format=kind)]
 
 
@@ -912,7 +915,21 @@ def a11y_act(
 ):
     """Operate a widget directly through accessibility: press buttons, toggle checkboxes, fill fields,
     pick list items, expand trees, read text. Works even if the widget is covered."""
-    return [ax.act(ref, action, value)] + _after(screenshot_after, wait_ms)
+    try:
+        msg = ax.act(ref, action, value)
+    except A11yError as ex:
+        # Some toolkits (GTK4 check boxes, many custom widgets) export no actions: fall back to the mouse.
+        if action.lower() not in ("click", "press", "activate", "default", "toggle", "open", "invoke") \
+                or "no actions" not in str(ex):
+            raise
+        box = ax.screen_box(ref)
+        if box is None:
+            raise A11yError(f"{ref} has no actions and no on-screen position; click it from a screenshot") from None
+        bx, by, bw, bh = box
+        vin.move_to(bx + bw / 2, by + bh / 2)
+        vin.click("left")
+        msg = f"{ref} has no a11y actions; clicked its center at screen ({round(bx + bw / 2)},{round(by + bh / 2)}){_note()}"
+    return [msg] + _after(screenshot_after, wait_ms)
 
 
 @tool()

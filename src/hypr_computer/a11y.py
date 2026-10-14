@@ -374,6 +374,8 @@ def _action_names(acc) -> list[str]:
 
 
 def _is_interactive(acc, role, states) -> bool:
+    if role in ("label", "static", "caption", "heading", "paragraph", "image", "separator"):
+        return role == "label" and any(n.lower() in ("click", "activate") for n in _action_names(acc))
     if role in INTERACTIVE_ROLES and role not in ("text", "table cell", "icon", "tool bar", "menu bar"):
         return True
     if states.contains(S.FOCUSABLE) or states.contains(S.EDITABLE) or states.contains(S.SELECTABLE):

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import atexit
 import math
+import os
 import shutil
 import subprocess
 import threading
@@ -71,6 +72,31 @@ BUTTONS = {
 
 class InputError(RuntimeError):
     pass
+
+
+LOCKERS = {"gtklock", "hyprlock", "swaylock", "waylock", "i3lock", "physlock"}
+
+
+def session_locked() -> str | None:
+    """Name of a running screen locker, if any. Input must never be sent to a lock screen."""
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        if name in LOCKERS:
+            return name
+    return None
+
+
+def ensure_unlocked():
+    name = session_locked()
+    if name:
+        raise InputError(f"the session is locked ({name} is running): refusing to send input to the lock "
+                         "screen. Ask the user to unlock, then retry.")
 
 
 def _xkb_from_hyprland() -> Keymap:
@@ -195,6 +221,7 @@ class VirtualInput:
     def resolve(self, combo: str) -> list[Stroke]:
         """'ctrl+shift+t' -> strokes. Returns a single chord as [Stroke(main, mods)]; a combo that is
         only modifiers ('super') becomes a stroke of the last modifier."""
+        ensure_unlocked()
         self.kbd  # ensures keymap
         tokens = _split_combo(combo)
         if not tokens:
@@ -237,6 +264,7 @@ class VirtualInput:
         raise InputError(f"unknown key {tok!r}")
 
     def key_down(self, code: int):
+        ensure_unlocked()
         self.kbd.write(e.EV_KEY, code, 1)
         self.kbd.syn()
         self.held_keys.add(code)
@@ -325,6 +353,7 @@ class VirtualInput:
     def move_to(self, x: float, y: float, duration: float = 0.15, steps: int | None = None):
         """Move the pointer to layout coords with real relative motion events (hover, drag targets,
         canvas input hooks all see it), then correct any residual exactly with a warp."""
+        ensure_unlocked()
         with self._lock:
             ptr = self.ptr
             cx, cy = hypr.cursor_pos()
@@ -361,6 +390,8 @@ class VirtualInput:
         code = BUTTONS.get(name.lower())
         if code is None:
             raise InputError(f"unknown button {name!r}; use one of {', '.join(BUTTONS)}")
+        if down:
+            ensure_unlocked()
         with self._lock:
             self.ptr.write(e.EV_KEY, code, 1 if down else 0)
             self.ptr.syn()
@@ -377,6 +408,7 @@ class VirtualInput:
     def scroll(self, dy: float = 0.0, dx: float = 0.0, step_delay: float = 0.03):
         """dy > 0 scrolls down (content moves up, like a wheel turned towards you), dx > 0 scrolls right.
         Units are wheel notches; fractions use hi-res events."""
+        ensure_unlocked()
         with self._lock:
             ptr = self.ptr
             for axis_lo, axis_hi, amount, sign in ((e.REL_WHEEL, e.REL_WHEEL_HI_RES, dy, -1),
@@ -401,6 +433,7 @@ class VirtualInput:
                 rotate: float = 0.0, duration: float = 0.35, hold_end: float = 0.0):
         """Multi-finger touchpad gesture. dx/dy in fraction of pad size for swipes (1.0 = full width).
         pinch: scale > 1 spreads fingers (zoom in), < 1 pinches together; rotate in degrees."""
+        ensure_unlocked()
         fingers = max(1, min(5, fingers))
         pad = self.pad
         W, H = self._pad_size
@@ -506,6 +539,7 @@ def _safe_active():
 
 
 def _wtype(text: str, delay: float):
+    ensure_unlocked()
     if not shutil.which("wtype"):
         raise InputError("wtype is not installed; cannot type characters outside the keyboard layout")
     args = ["wtype", "-d", str(max(0, int(delay * 1000))), "--", text]
