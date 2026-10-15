@@ -24,8 +24,8 @@ async def main(calls):
                     print("[image]", p)
 
 calls = [eval(a) for a in sys.argv[1:]] if len(sys.argv) > 1 else [
-    ("desktop", {}), ("windows", {}), ("screenshot", {"monitor": "eDP-1"}),
-    ("ocr", {"query": "Share", "monitor": "eDP-1"}), ("apps", {"query": "files"}),
+    ("desktop", {}), ("windows", {}), ("screenshot", {}),
+    ("ocr", {"query": "File"}), ("apps", {"query": "files"}),
     ("hyprland", {"lua": "return hl.get_active_window().title"}), ("clipboard", {"action": "types"}),
 ]
 asyncio.run(main(calls))

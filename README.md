@@ -4,8 +4,10 @@ Computer use for Hyprland on Wayland, as an MCP server. An agent can see every s
 anything a person can: mouse, keyboard (compositor binds too), touchpad gestures, windows, the
 clipboard, OCR, and widgets through the accessibility tree.
 
-Built for Hyprland 0.56 (Lua config) and works with the Phantomat infinite canvas: window positions
-are mapped from canvas coordinates to the screen.
+Built for Hyprland 0.56+ (Lua config). It also works with the
+[Phantomat](https://github.com/kaolti/phantomat) infinite-canvas plugin: window positions are mapped from
+canvas coordinates to the screen. Pairs with [agentControl](https://github.com/zinoos/agent-control), which
+streams each agent's desktop next to its Claude Code terminal.
 
 ## Agent desktops (the default)
 
@@ -26,19 +28,18 @@ your Hyprland (one seat: your mouse + keyboard)
 - On first use the server starts an agent desktop on the first free place 4-9/0 (`agent_desktop(start,
   place=N)` to pick one). Press Super+N to watch it live: the agent's cursor (software-rendered, so
   visible) and windows, 1:1.
-- `~/.config/hypr/agent-places.lua` puts each viewer full-size into its place without splitting the place
-  you're on or taking focus. A small Phantomat patch makes a window placed this way open without the
-  camera following it.
-- Viewers are watch-only (`no_focus`) by default. `agent_desktop(viewer, hands_on=true)` (or
-  `AgentPlaces.toggle_hands_on()` bound to a key) lets you click and type into the agent's desktop,
-  e.g. to log in somewhere for it.
+- Without extra setup a viewer goes to plain workspace N. The optional
+  [`contrib/agent-places.lua`](contrib/agent-places.lua) helper puts each viewer full-size into its
+  place without splitting the place you're on or taking focus (see [Install](#install)).
+- Viewers are capture-only: they show the agent's screen, and your input never reaches it.
 - Other viewer modes: `pip` (small, pinned over everything), `window`, `tile`, `hidden`.
 - Closing the viewer stops that agent desktop (a small watchdog process notices).
 - Browsers launched on an agent desktop get their own profile under
   `~/.local/share/hypr-computer/agents/<name>/`, otherwise they'd open in your running instance.
-- `agent_desktop(action="use_host")` switches the tools to your real desktop (the original mode: shared
-  mouse/keyboard via uinput, refused while the screen is locked). `HYPR_COMPUTER_TARGET=host` makes that
-  the default.
+- `agent_desktop(action="use_host")` switches the tools to your real desktop, read-only: screenshots, OCR,
+  window list. `HYPR_COMPUTER_TARGET=host` makes that the default. Input to your real desktop (shared
+  mouse and keyboard via uinput, refused while the screen is locked) is off unless you set
+  `HYPR_COMPUTER_ALLOW_HOST_INPUT=1`.
 
 ## Tools
 
@@ -72,13 +73,13 @@ On an agent desktop: a pure-Python Wayland client creates `zwlr_virtual_pointer_
 buttons, wheel) and `zwp_virtual_keyboard_v1` (keymap uploaded from libxkbcommon, modifiers tracked with
 an xkb state) on the nested compositor. No touchpad gestures there.
 
-On the host (`use_host`):
+On the host (`use_host`, only with `HYPR_COMPUTER_ALLOW_HOST_INPUT=1`):
 
 - Three virtual devices on `/dev/uinput`: a keyboard, a pointer and a touchpad. They are created on
   first use and live as long as the server. Hyprland refocuses when a device is plugged in, so the
   server puts focus back afterwards.
 - Keys are real evdev keycodes. The text→key map comes from libxkbcommon using the layout Hyprland
-  reports (e.g. Swiss German: `z` = KEY_Y, `@` = AltGr+2). Characters the layout can't produce
+  reports (e.g. German: `z` = KEY_Y, `@` = AltGr+Q). Characters the layout can't produce
   (emoji, dead-key-only characters like `~`) go through `wtype`.
 - The pointer moves with real relative motion (hover and drag targets see the path). Hyprland sets
   this device to flat acceleration. A final `hl.dsp.cursor.move` warp fixes any leftover error,
@@ -87,15 +88,43 @@ On the host (`use_host`):
 
 ## Install
 
-Needs: Hyprland, `grim`, `tesseract` (eng), `wtype`, `wl-clipboard`, plus system Python packages
-`python3-evdev`, `python3-gobject` with AT-SPI (`Atspi-2.0`) and `python3-pillow`. Your user also
-needs write access to `/dev/uinput`.
+Requirements: Hyprland 0.56+ with a Lua config, Python 3.12+, [uv](https://docs.astral.sh/uv/), and these
+system packages (PyGObject and evdev come from the system Python, which the venv shares):
+
+| Distro | Install |
+|---|---|
+| Fedora | `sudo dnf install grim tesseract tesseract-langpack-eng wtype wl-clipboard dbus-daemon at-spi2-core gtk4 python3-gobject python3-evdev python3-pillow` |
+| Debian / Ubuntu | `sudo apt install grim tesseract-ocr wtype wl-clipboard dbus-daemon at-spi2-core gir1.2-gtk-4.0 gir1.2-atspi-2.0 python3-gi python3-evdev python3-pil` |
+| Arch | `sudo pacman -S grim tesseract tesseract-data-eng wtype wl-clipboard dbus at-spi2-core gtk4 python-gobject python-evdev python-pillow` |
 
 ```sh
+git clone https://github.com/zinoos/hypr-computer.git ~/projects/hypr-computer
 cd ~/projects/hypr-computer
 uv venv --python /usr/bin/python3 --system-site-packages .venv
 uv pip install --python .venv/bin/python -e .
-claude mcp add --scope user hypr-computer -- ~/projects/hypr-computer/.venv/bin/python -m hypr_computer
+claude mcp add --scope user hypr-computer -- "$PWD/.venv/bin/python" -m hypr_computer
+```
+
+Other MCP clients: run `<checkout>/.venv/bin/python -m hypr_computer` as a stdio server.
+
+Optional, for viewers that drop neatly into their place (recommended with Phantomat):
+
+```sh
+cp contrib/agent-places.lua ~/.config/hypr/
+echo 'dofile(os.getenv("HOME") .. "/.config/hypr/agent-places.lua")' >> ~/.config/hypr/hyprland.lua
+hyprctl reload
+```
+
+Agent desktops take workspaces/places 4-9 and 0; 1-3 stay yours. Your own windows on 4-0 aren't
+touched, but each agent's viewer opens there.
+
+Optional, only if you want agents to drive your real desktop (`HYPR_COMPUTER_ALLOW_HOST_INPUT=1`):
+write access to `/dev/uinput`, for example
+
+```sh
+echo 'KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"' | sudo tee /etc/udev/rules.d/60-uinput.rules
+sudo usermod -aG input "$USER"   # then log out and back in
+sudo udevadm control --reload && sudo udevadm trigger
 ```
 
 Tests (over stdio; images go to `$OUT`):
@@ -107,6 +136,8 @@ Tests (over stdio; images go to `$OUT`):
 
 - `HYPR_COMPUTER_MAX_EDGE` / `HYPR_COMPUTER_MAX_PIXELS`: screenshot size limits (defaults 1568 / 1150000)
 - `HYPR_COMPUTER_OCR_LANGS`: tesseract languages (default `eng`; `eng+deu` is slower but reads umlauts)
+- `HYPR_COMPUTER_TARGET`: `agent` (default) or `host`: where the tools act on start
+- `HYPR_COMPUTER_ALLOW_HOST_INPUT=1`: allow mouse/keyboard input on your real desktop (off by default)
 
 ## Notes
 
@@ -115,3 +146,7 @@ Tests (over stdio; images go to `$OUT`):
   `--force-renderer-accessibility` (`launch(accessibility=true)` adds it). kitty exposes nothing.
 - On the canvas, `window(action="focus")` brings a window on screen. A window that is off screen
   can't be captured.
+
+## License
+
+[MIT](LICENSE)

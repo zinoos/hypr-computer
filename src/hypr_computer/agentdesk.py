@@ -142,6 +142,14 @@ def _host_keyboard(host_sig: str) -> tuple[str, str]:
         return "us", ""
 
 
+def _libexec(name: str) -> str | None:
+    """at-spi helpers live in /usr/libexec (Fedora), /usr/lib (Arch) or /usr/lib/at-spi2-core (Debian/Ubuntu)."""
+    for d in ("/usr/libexec", "/usr/lib", "/usr/lib/at-spi2-core", "/usr/libexec/at-spi2-core"):
+        if os.path.exists(os.path.join(d, name)):
+            return os.path.join(d, name)
+    return None
+
+
 def _host_cursor_theme() -> str:
     t = os.environ.get("XCURSOR_THEME") or os.environ.get("HYPRCURSOR_THEME")
     return f'hl.env("XCURSOR_THEME", "{t}")\nhl.env("HYPRCURSOR_THEME", "{t}")' if t else ""
@@ -225,9 +233,9 @@ def start(name: str | None = None, width: int | None = None, height: int | None 
     # Accessibility on the private bus: D-Bus activation of the AT-SPI launcher fails there, so start it
     # (and its registry) directly; both exit when the bus goes away.
     aux = []
-    for cmd in (["/usr/libexec/at-spi-bus-launcher", "--launch-immediately", "--a11y=1"],
-                ["/usr/libexec/at-spi2-registryd"]):
-        if os.path.exists(cmd[0]):
+    for cmd in ([_libexec("at-spi-bus-launcher"), "--launch-immediately", "--a11y=1"],
+                [_libexec("at-spi2-registryd")]):
+        if cmd[0]:
             aux.append(subprocess.Popen(cmd, env=dict(os.environ, DBUS_SESSION_BUS_ADDRESS=bus), start_new_session=True,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid)
             time.sleep(0.3)

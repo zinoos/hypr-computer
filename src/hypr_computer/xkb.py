@@ -1,7 +1,7 @@
 """Keysym/character -> (evdev keycode, modifiers) for the active XKB layout, via libxkbcommon (ctypes).
 
 uinput sends physical keycodes; the compositor turns them into symbols with the user's layout
-(here e.g. Swiss German, where 'z' sits on KEY_Y and '@' is AltGr+2). This module inverts that map.
+(e.g. Swiss German, where 'z' sits on KEY_Y and '@' is AltGr+2). This module inverts that map.
 """
 
 from __future__ import annotations
