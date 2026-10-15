@@ -36,7 +36,8 @@ the accessibility tree.
 By default you work on your OWN agent desktop: a separate Hyprland session with its own cursor,
 keyboard focus, clipboard, D-Bus and apps, started on first use. It lives on one of the user's desktop
 numbers 4-9/0 (1-3 are theirs): they press Super+N to watch you live, while they keep working
-undisturbed elsewhere. It starts empty: launch() the apps you need (browsers get a separate profile,
+undisturbed elsewhere. If you run inside agentControl ($AGENTCONTROL_SESSION is set), your tile there also
+streams this desktop with your last action as a ticker, and the user can message you from it. It starts empty: launch() the apps you need (browsers get a separate profile,
 so the user's logins aren't there). Your cursor and keyboard are yours alone: the user's input never
 reaches your desktop and you can never move or type with theirs. agent_desktop(action='use_host') only
 lets you look at the user's real desktop (screenshots, OCR, window list), not act on it.
