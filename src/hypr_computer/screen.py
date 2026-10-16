@@ -22,6 +22,7 @@ from . import hypr, target
 # under both keeps the image the model sees identical to the frame we map coordinates through.
 MAX_EDGE = int(os.environ.get("HYPR_COMPUTER_MAX_EDGE", 1568))
 MAX_PIXELS = int(os.environ.get("HYPR_COMPUTER_MAX_PIXELS", 1_150_000))
+AFTER_EDGE = int(os.environ.get("HYPR_COMPUTER_AFTER_EDGE", 900))
 OCR_LANGS = os.environ.get("HYPR_COMPUTER_OCR_LANGS", "eng")
 
 
