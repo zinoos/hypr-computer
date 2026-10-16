@@ -135,6 +135,7 @@ Tests (over stdio; images go to `$OUT`):
 ## Environment knobs
 
 - `HYPR_COMPUTER_MAX_EDGE` / `HYPR_COMPUTER_MAX_PIXELS`: screenshot size limits (defaults 1568 / 1150000)
+- `HYPR_COMPUTER_AFTER_EDGE`: long edge in px of the image returned by `screenshot_after=true` (default 900)
 - `HYPR_COMPUTER_OCR_LANGS`: tesseract languages (default `eng`; `eng+deu` is slower but reads umlauts)
 - `HYPR_COMPUTER_TARGET`: `agent` (default) or `host`: where the tools act on start
 - `HYPR_COMPUTER_ALLOW_HOST_INPUT=1`: allow mouse/keyboard input on your real desktop (off by default)

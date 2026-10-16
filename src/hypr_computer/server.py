@@ -47,9 +47,10 @@ drag, scroll refer to the pixels of the most recent frame unless you pass frame=
 (Hyprland layout coordinates). Instead of pixels you can target text='Save' (OCR finds it, add
 index= to pick among several) or ref='e12' (an element from a11y_tree) or ref='t3' (an ocr hit).
 
-Good loop: screenshot -> act (with screenshot_after=true to see the result) -> verify.
-Prefer a11y_tree + a11y_act for apps that expose accessibility (GTK, Qt, LibreOffice, Firefox):
-it's exact and needs no pixels. Use zoom on small UI before clicking tiny targets.
+Good loop: read the UI as text first (a11y_tree + a11y_act for apps that expose accessibility: GTK, Qt,
+LibreOffice, Firefox; exact and needs no pixels), use wait(until_text=...) instead of fixed waits, and take
+pixels only when text is not enough. screenshot_after=true returns a small check image (long edge 900);
+call screenshot() when you need detail. Use zoom on small UI before clicking tiny targets.
 On the host desktop the user may be using the machine: keep actions purposeful, stop if they take over.
 """
 
@@ -302,7 +303,9 @@ def _after(screenshot_after: bool, wait_ms: int, monitor: str | None = None) -> 
     if not screenshot_after:
         return []
     img, box, label = _capture(monitor=monitor or "cursor")
-    _, content = _make_frame(img, box, label)
+    # check image after an action: smaller than a deliberate screenshot() to save tokens
+    _, content = _make_frame(img, box, label, max_size=scr.AFTER_EDGE)
+    content[0] += " Reduced check image: if text is unreadable or detail is unclear, call screenshot() (full size) or zoom()."
     return content
 
 
