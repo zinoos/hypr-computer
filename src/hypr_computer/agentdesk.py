@@ -257,6 +257,8 @@ def start(name: str | None = None, width: int | None = None, height: int | None 
     # HYPRLAND_INSTANCE_SIGNATURE/PATH into the user's systemd + D-Bus activation environment
     # (and unsets them on exit), so services started afterwards land on the agent desktop.
     env.update(WAYLAND_DISPLAY=host_wayland, DBUS_SESSION_BUS_ADDRESS=bus, HYPRLAND_NO_SD_VARS="1")
+    for k, v in _host_gpu_env(host_sig).items():
+        env.setdefault(k, v)
     log = open(os.path.join(run_dir, "hyprland.log"), "w")
     proc = subprocess.Popen(["Hyprland", "-c", cfg], env=env, stdout=log, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL, start_new_session=True, cwd=state_dir)
@@ -385,6 +387,23 @@ def _instances() -> list[dict]:
                                          timeout=5).stdout or "[]")
     except Exception:
         return []
+
+
+GPU_VARS = ("GBM_BACKENDS_PATH", "LIBGL_DRIVERS_PATH", "LIBVA_DRIVERS_PATH", "__EGL_VENDOR_LIBRARY_FILENAMES",
+            "LD_LIBRARY_PATH", "VK_ICD_FILENAMES", "VK_LAYER_PATH")
+
+
+def _host_gpu_env(host_sig: str) -> dict:
+    """The nixGL driver variables of the host Hyprland. A Nix-built Hyprland finds Mesa only through them
+    (no /run/opengl-driver on Fedora); an MCP server started outside the Hyprland session (e.g. from
+    agentControl's tmux server) lacks them, and the nested Hyprland then dies in CBackend::create()."""
+    pid = next((i.get("pid") for i in _instances() if i.get("instance") == host_sig), None)
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            pairs = (kv.decode(errors="replace").partition("=") for kv in f.read().split(b"\0") if kv)
+            return {k: v for k, _, v in pairs if k in GPU_VARS}
+    except (OSError, TypeError):
+        return {}
 
 
 def viewer_window(d: Desk) -> dict | None:
