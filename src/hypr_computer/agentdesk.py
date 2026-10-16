@@ -81,7 +81,9 @@ class Desk:
         return e
 
     def alive(self) -> bool:
-        return _alive(self.pid)
+        # The recorded pid is the launcher, which exits once Hyprland has forked; the compositor
+        # lives on in the same process group, so that is what decides whether the desktop is up.
+        return _alive(self.pid) or _group_alive(self.pid)
 
     def save(self):
         os.makedirs(RUN, exist_ok=True)
@@ -99,6 +101,14 @@ def _alive(pid: int) -> bool:
             return f.read().split()[2] != "Z"
     except OSError:
         return False
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except OSError:
+        return False
+    return True
 
 
 def list_desks() -> list[Desk]:
@@ -473,21 +483,54 @@ def place_viewer(d: Desk, mode: str = "pip", scale: float = 0.5, corner: str = "
     return f"viewer is a floating {vw}x{vh} window on the current place of {m['name']}"
 
 
-def stop(d: Desk) -> str:
+IDLE_SECONDS = 30 * 60  # an agent desktop nobody has used for this long is stopped
+
+
+def last_used(d: Desk) -> float:
     try:
-        hypr.dispatch("hl.dsp.exit()", d.sig)
-    except Exception:
-        pass
+        with open(os.path.join(RUN, f"{d.name}.activity")) as f:
+            return float(json.load(f)["t"])
+    except (OSError, ValueError, KeyError):
+        return d.created
+
+
+def reap(max_idle: float = IDLE_SECONDS) -> list[str]:
+    """Stop agent desktops whose MCP server is gone or that have been idle too long. Returns what was stopped."""
+    stopped = []
+    now = time.time()
+    for d in list_desks():
+        if not _alive(d.owner_pid):
+            reason = "owner gone"
+        elif now - last_used(d) > max_idle:
+            reason = "idle"
+        else:
+            continue
+        stop(d)
+        stopped.append(f"{d.name} ({reason})")
+    return stopped
+
+
+def stop(d: Desk) -> str:
+    # Only ask this desktop to exit if its own socket exists. hypr.dispatch falls back to the newest
+    # Hyprland instance when the signature is unknown, which would be the user's host session.
+    run = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if d.sig and os.path.exists(os.path.join(run, "hypr", d.sig, ".socket.sock")):
+        try:
+            hypr.dispatch("hl.dsp.exit()", d.sig)
+        except Exception:
+            pass
     t0 = time.time()
     while d.alive() and time.time() - t0 < 5:
         time.sleep(0.1)
     # Hyprland forks; everything it started shares its process group (start_new_session).
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(d.pid, sig)
-        except OSError:
-            break
-        time.sleep(0.8)
+    # Never signal our own group or init's.
+    if d.pid > 1 and os.getpgrp() != d.pid:
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(d.pid, sig)
+            except OSError:
+                break
+            time.sleep(0.8)
     for pid in d.aux_pids + ([d.viewer_pid] if d.viewer_pid and d.viewer_pid != os.getpid() else []):
         try:
             os.kill(pid, signal.SIGTERM)

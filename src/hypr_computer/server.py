@@ -1217,7 +1217,9 @@ def agent_desktop(
         description="pip corner")] = "bottom-right",
 ):
     """Manage agent desktops: separate Hyprland sessions with their own cursor, keyboard focus, clipboard
-    and apps, which the user watches in a live viewer window while using their own desktop."""
+    and apps, which the user watches in a live viewer window while using their own desktop.
+    When you are finished with a desktop, call action='stop' so its apps and processes close. Desktops
+    left unused for 30 minutes, or whose agent has ended, are stopped automatically."""
     global _mode
     h = target.host()
     if action == "use_host":
@@ -1330,10 +1332,26 @@ def _session_env():
         os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={run}/bus"
 
 
+def _reap_loop():
+    """Stop agent desktops whose agent is gone or that have sat unused, so they don't pile up."""
+    while True:
+        time.sleep(60)
+        try:
+            with _tool_lock:
+                stopped = agentdesk.reap()
+                if _desk and not _desk.alive():
+                    _use_host_after_stop()
+            if stopped:
+                print(f"hypr-computer: stopped agent desktops: {', '.join(stopped)}", file=sys.stderr)
+        except Exception as e:  # never let the reaper take the server down
+            print(f"hypr-computer: reap failed: {e}", file=sys.stderr)
+
+
 def main():
     _session_env()
     if not shutil.which("grim"):
         raise SystemExit("hypr-computer needs grim on PATH")
+    threading.Thread(target=_reap_loop, daemon=True).start()
     mcp.run()
 
 
