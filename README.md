@@ -5,13 +5,23 @@
   </picture>
 </p>
 
-# hypr-computer
+<p align="center">
+  <b>Computer use for Hyprland on Wayland, as an MCP server.</b><br>
+  Give Claude (or any MCP client) a Linux desktop it can actually use.
+</p>
 
-**Computer use for Hyprland on Wayland, as an MCP server.**
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#what-it-looks-like">What it looks like</a> ·
+  <a href="#tools">Tools</a> ·
+  <a href="#targets-and-coordinates">Targets</a> ·
+  <a href="#your-real-desktop">Your real desktop</a> ·
+  <a href="#configuration">Configuration</a> ·
+  <a href="#troubleshooting">Troubleshooting</a>
+</p>
 
-Give Claude (or any MCP client) a Linux desktop it can actually use: it sees the screen, moves and
-clicks the mouse, types on a real keyboard layout, swipes on a touchpad, manages windows, reads text
-with OCR and operates widgets through the accessibility tree.
+It sees the screen, moves and clicks the mouse, types on a real keyboard layout, swipes on a touchpad,
+manages windows, reads text with OCR and operates widgets through the accessibility tree.
 
 By default every agent works on **its own desktop**: a nested Hyprland with its own cursor, focus,
 clipboard and apps. You watch it live with Super+N and keep working undisturbed on yours.
@@ -21,12 +31,6 @@ clipboard and apps. You watch it live with Super+N and keep working undisturbed 
   coordinates are mapped to the screen)
 - Pairs with [agentControl](https://github.com/zinoos/agent-control), which streams each agent's
   desktop next to its Claude Code terminal
-
-**Contents:** [Quick start](#quick-start) · [What it looks like](#what-it-looks-like) ·
-[Tools](#tools) · [Targets and coordinates](#targets-and-coordinates) ·
-[Your real desktop](#your-real-desktop) · [Configuration](#configuration) ·
-[Troubleshooting](#troubleshooting) · [How input works](#how-input-works) ·
-[Development](#development)
 
 ---
 
