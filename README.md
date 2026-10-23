@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/lockup-animated-dark.svg">
+    <img src="docs/logo/lockup-animated.svg" alt="hypr-computer" width="440">
+  </picture>
+</p>
+
 # hypr-computer
 
 **Computer use for Hyprland on Wayland, as an MCP server.**
