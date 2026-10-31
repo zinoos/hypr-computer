@@ -218,6 +218,8 @@ OUT=/tmp/hc .venv/bin/python tests/smoke.py        # read-only tools
 OUT=/tmp/hc .venv/bin/python tests/live.py         # same as agent_live on your REAL desktop: injects input, run only when you're away
 ```
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/zinoos-hypr-computer-16ae9t?v=c7006f5d7c5a455951028abe2bdf51ae)](https://m8ven.ai/mcp/zinoos-hypr-computer-16ae9t?s=readme)
+
 ## License
 
 [MIT](LICENSE)
